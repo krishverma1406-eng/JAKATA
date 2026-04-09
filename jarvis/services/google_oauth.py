@@ -5,9 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from config.settings import SETTINGS
-
-
 def get_google_service(
     api_name: str,
     api_version: str,

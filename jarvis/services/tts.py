@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import random
 import re
 import tempfile
@@ -100,6 +101,20 @@ async def speak(text: str, settings: Settings | None = None) -> bool:
         temp_path.unlink(missing_ok=True)
 
 
+async def synthesize_base64(text: str, settings: Settings | None = None) -> str | None:
+    config = settings or SETTINGS
+    payload = _prepare_spoken_text(text)
+    if not config.tts_enabled or not payload:
+        return None
+
+    temp_path = Path(tempfile.gettempdir()) / f"jarvis_tts_b64_{threading.get_ident()}.mp3"
+    try:
+        await save_to_file(payload, temp_path, config)
+        return base64.b64encode(temp_path.read_bytes()).decode("ascii")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def speak_sync(text: str, settings: Settings | None = None) -> bool:
     result: dict[str, bool] = {"spoken": False}
     error: list[BaseException] = []
@@ -117,3 +132,22 @@ def speak_sync(text: str, settings: Settings | None = None) -> bool:
     if error:
         raise error[0]
     return result["spoken"]
+
+
+def synthesize_base64_sync(text: str, settings: Settings | None = None) -> str | None:
+    result: dict[str, str | None] = {"audio": None}
+    error: list[BaseException] = []
+
+    def _runner() -> None:
+        try:
+            result["audio"] = asyncio.run(synthesize_base64(text, settings))
+        except BaseException as exc:  # pragma: no cover - passthrough wrapper
+            error.append(exc)
+
+    worker = threading.Thread(target=_runner, daemon=True)
+    worker.start()
+    worker.join()
+
+    if error:
+        raise error[0]
+    return result["audio"]

@@ -958,7 +958,7 @@ class Brain:
             reminder = data.get("reminder") if isinstance(data.get("reminder"), dict) else {}
             if reminder:
                 text = str(reminder.get("text", "")).strip()
-                due_at = str(reminder.get("due_at", "")).strip()
+                due_at = str(reminder.get("due_at_local") or reminder.get("due_at", "")).strip()
                 if text and due_at:
                     return f"Reminder set for {due_at}: {text}"
             reminders = data.get("reminders")
@@ -970,7 +970,7 @@ class Brain:
                     if not isinstance(item, dict):
                         continue
                     text = str(item.get("text", "")).strip()
-                    due_at = str(item.get("due_at", "")).strip()
+                    due_at = str(item.get("due_at_local") or item.get("due_at", "")).strip()
                     if text and due_at:
                         lines.append(f"{text} | due {due_at}")
                 if lines:

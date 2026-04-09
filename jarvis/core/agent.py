@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Callable
 
 from config.settings import SETTINGS, Settings
@@ -28,9 +29,21 @@ class Agent:
         self.tools = tools or ToolRegistry(settings=self.settings)
         self.memory = memory or Memory(self.settings)
         self.planner = planner or Planner(self.brain)
+        self.session_id = ""
         self.history: list[dict[str, Any]] = []
+        self.bind_session()
 
-    def run(self, user_message: str, stream_handler: Callable[[str], None] | None = None) -> str:
+    def bind_session(self, session_id: str | None = None) -> str:
+        self.session_id = session_id or uuid.uuid4().hex[:12]
+        self.history = self.memory.load_session_messages(self.session_id, limit_messages=12)
+        return self.session_id
+
+    def run(
+        self,
+        user_message: str,
+        stream_handler: Callable[[str], None] | None = None,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
         self.tools.refresh()
         memory_context = self._load_memory_context(user_message)
         all_tool_definitions = self.tools.get_tool_definitions()
@@ -48,11 +61,12 @@ class Agent:
         task_kind = self._task_kind(user_message, plan)
 
         for _ in range(self.settings.agent_max_iterations):
+            active_stream_handler = stream_handler if (not tool_definitions or tool_trace) else None
             response = self.brain.chat(
                 messages=messages,
                 tools=tool_definitions,
                 task_kind=task_kind,
-                stream_handler=stream_handler if not tool_definitions else None,
+                stream_handler=active_stream_handler,
             )
             tool_calls = response.get("tool_calls", [])
 
@@ -75,6 +89,14 @@ class Agent:
 
             for tool_call in tool_calls:
                 plan_step_index = self.planner.next_matching_step_index(plan, tool_call["name"])
+                if event_handler is not None:
+                    event_handler(
+                        {
+                            "type": "tool_started",
+                            "name": tool_call["name"],
+                            "arguments": tool_call.get("arguments", {}),
+                        }
+                    )
                 result = self.tools.run_tool(tool_call["name"], tool_call.get("arguments", {}))
                 tool_trace.append(
                     {
@@ -83,6 +105,15 @@ class Agent:
                         "result": result,
                     }
                 )
+                if event_handler is not None:
+                    event_handler(
+                        {
+                            "type": "tool_result",
+                            "name": tool_call["name"],
+                            "arguments": tool_call.get("arguments", {}),
+                            "result": result,
+                        }
+                    )
                 self.planner.mark_step_completed(
                     plan,
                     tool_name=tool_call["name"],
@@ -112,6 +143,19 @@ class Agent:
         plan_note: str,
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
+        daily_summary = self.memory.get_daily_context_summary(self.brain)
+
+        if daily_summary:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Daily user context summary:\n"
+                        f"{daily_summary}\n\n"
+                        "Use this as lightweight internal context, not as something to quote directly."
+                    ),
+                }
+            )
 
         if memory_context:
             memory_block = (
@@ -190,12 +234,26 @@ class Agent:
             "working on",
             "told you",
             "about my",
+            "remember that",
+            "forget that",
+            "forget what",
             "my ",
             "i like",
             "i am",
             "who am i",
+            "who is ",
             "what do i",
             "history",
+            "chat so far",
+            "conversation so far",
+            "our chat",
+            "recent chat",
+            "recent conversation",
+            "what have we done",
+            "what we have done",
+            "what did we talk",
+            "what we talked",
+            "recently",
             "context",
             "notes",
             "earlier",
@@ -298,8 +356,12 @@ class Agent:
         self.memory.persist_conversation(
             user_message=user_message,
             assistant_message=assistant_message,
-            conversation=messages + [{"role": "assistant", "content": assistant_message}],
+            conversation=[
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": assistant_message},
+            ],
             tool_trace=tool_trace,
+            session_id=self.session_id,
             brain=self.brain,
             should_extract=self._should_extract_memory(user_message, tool_trace),
             background=self.settings.background_memory_persistence,

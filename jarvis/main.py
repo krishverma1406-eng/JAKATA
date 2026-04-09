@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import threading
 from dataclasses import replace
 
@@ -30,7 +29,7 @@ def _speak_in_background(agent: Agent, response: str) -> None:
 
 def _notify_reminder(agent: Agent, reminder: dict[str, object], print_lock: threading.Lock | None = None) -> None:
     text = str(reminder.get("text", "")).strip()
-    due_at = str(reminder.get("due_at", "")).strip()
+    due_at = str(reminder.get("due_at_local") or reminder.get("due_at", "")).strip()
     message = f"JARVIS reminder: {text}"
     if due_at:
         message += f" (due {due_at})"
@@ -58,7 +57,14 @@ def main() -> None:
     parser.add_argument("--github-login", action="store_true", help="Authorize GitHub/Copilot device flow")
     parser.add_argument("--voice", action="store_true", help="Enable push-to-talk in the interactive session")
     parser.add_argument("--wake", action="store_true", help="Enable wake-word listening in the interactive session")
+    parser.add_argument("--web", action="store_true", help="Start the FastAPI frontend server")
     args = parser.parse_args()
+
+    if args.web:
+        import uvicorn
+
+        uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=False)
+        return
 
     if args.github_login:
         try:
@@ -130,6 +136,9 @@ def _run_combined_mode(agent: Agent) -> None:
         try:
             play_activation_sound(agent.settings)
             transcript = stt.listen_once()
+        except KeyboardInterrupt:
+            _safe_print("JARVIS: Voice capture cancelled.")
+            return
         except Exception as exc:
             _safe_print(f"JARVIS: Voice capture failed: {exc}")
             return

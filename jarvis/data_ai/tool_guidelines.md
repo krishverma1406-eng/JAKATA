@@ -4,7 +4,7 @@
 | `datetime_tool` | The user asks for the current time, date, day, timezone conversion, or scheduling context | Use before answering time/date questions |
 | `file_manager` | The user says open, read, save, write, list, find, summarize, inspect PDFs, inspect `.docx`, or check whether files changed | Confirm before overwriting. `watch` is manual polling, not background notifications |
 | `browser_control` | A normal web search is not enough and the task needs opening a browser page or fetching page text | Basic only. No Playwright, no clicking selectors, no login flows, no screenshots |
-| `memory_query` | The user asks personal questions, refers to past conversations, preferences, projects, prior commitments, or asks things like "what do you know about me", "who am I", or "what is my github username" | Run this first for user-history questions |
+| `memory_query` | The user asks personal questions, refers to past conversations, preferences, projects, prior commitments, asks things like "what do you know about me", "who am I", "who is Shaurya", "remember that ...", or "forget what I said about ..." | Use this for memory search, explicit remember, explicit forget, and entity lookups |
 | `reminder_tool` | The user asks to set, list, delete, or check reminders | Stores reminders in `data_user/reminders.json` and due reminders can be surfaced on startup |
 | `clipboard_tool` | The user wants to inspect, copy, replace, or clear clipboard text | Good for summarizing or reusing copied text |
 | `notes_tool` | The user wants intentional notes created, read, searched, listed, or deleted | Uses markdown notes in `data_user/notes`, separate from auto memory |

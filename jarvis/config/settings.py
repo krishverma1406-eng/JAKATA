@@ -21,11 +21,14 @@ DATA_AI_DIR = BASE_DIR / "data_ai"
 DATA_USER_DIR = BASE_DIR / "data_user"
 MEMORY_DIR = BASE_DIR / "memory"
 MEMORY_LOGS_DIR = MEMORY_DIR / "logs"
-LEGACY_VECTOR_DIR = MEMORY_DIR / "vector_db"
+MEMORY_SESSIONS_DIR = MEMORY_DIR / "sessions"
 USER_CHUNKS_DIR = DATA_USER_DIR / "chunks"
 USER_VECTOR_DIR = DATA_USER_DIR / "vector_index"
 USER_NOTES_DIR = DATA_USER_DIR / "notes"
 USER_REMINDERS_FILE = DATA_USER_DIR / "reminders.json"
+USER_MEMORY_RECORDS_FILE = DATA_USER_DIR / "memory_records.json"
+USER_ENTITIES_FILE = DATA_USER_DIR / "entities.json"
+USER_MEMORY_SUMMARY_CACHE_FILE = DATA_USER_DIR / "memory_daily_summary.json"
 SCREENSHOTS_DIR = DATA_USER_DIR / "screenshots"
 GOOGLE_TOKEN_DIR = CONFIG_DIR / "google"
 ENV_FILE = CONFIG_DIR / ".env"
@@ -88,6 +91,8 @@ class Settings:
     agent_max_iterations: int
     memory_top_k: int
     memory_embedding_model: str
+    memory_confidence_threshold: int
+    memory_decay_days: int
     planner_simple_word_limit: int
     planner_complex_word_limit: int
     background_memory_persistence: bool
@@ -161,6 +166,8 @@ SETTINGS = Settings(
         "sentence-transformers/all-MiniLM-L6-v2",
     )
     or "sentence-transformers/all-MiniLM-L6-v2",
+    memory_confidence_threshold=int(_getenv("MEMORY_CONFIDENCE_THRESHOLD", "7") or "7"),
+    memory_decay_days=int(_getenv("MEMORY_DECAY_DAYS", "30") or "30"),
     planner_simple_word_limit=int(_getenv("PLANNER_SIMPLE_WORD_LIMIT", "8") or "8"),
     planner_complex_word_limit=int(_getenv("PLANNER_COMPLEX_WORD_LIMIT", "18") or "18"),
     background_memory_persistence=_parse_bool(
@@ -202,7 +209,7 @@ def ensure_directories() -> None:
 
     for directory in (
         MEMORY_LOGS_DIR,
-        LEGACY_VECTOR_DIR,
+        MEMORY_SESSIONS_DIR,
         USER_CHUNKS_DIR,
         USER_VECTOR_DIR,
         USER_NOTES_DIR,

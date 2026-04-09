@@ -5,18 +5,29 @@ from __future__ import annotations
 import contextlib
 import difflib
 import io
-import json
 import importlib
+import json
 import logging
 import math
 import re
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from config.settings import DATA_USER_DIR, MEMORY_LOGS_DIR, SETTINGS, USER_CHUNKS_DIR, USER_VECTOR_DIR, Settings
+from config.settings import (
+    DATA_USER_DIR,
+    MEMORY_LOGS_DIR,
+    MEMORY_SESSIONS_DIR,
+    SETTINGS,
+    USER_ENTITIES_FILE,
+    USER_CHUNKS_DIR,
+    USER_MEMORY_RECORDS_FILE,
+    USER_MEMORY_SUMMARY_CACHE_FILE,
+    USER_VECTOR_DIR,
+    Settings,
+)
 
 
 class Memory:
@@ -25,62 +36,218 @@ class Memory:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or SETTINGS
         self.logs_dir = MEMORY_LOGS_DIR
+        self.sessions_dir = MEMORY_SESSIONS_DIR
         self.chunks_dir = USER_CHUNKS_DIR
         self.vector_dir = USER_VECTOR_DIR
         self.profile_path = DATA_USER_DIR / "profile.md"
         self.projects_path = DATA_USER_DIR / "projects.md"
+        self.records_path = USER_MEMORY_RECORDS_FILE
+        self.entities_path = USER_ENTITIES_FILE
+        self.daily_summary_path = USER_MEMORY_SUMMARY_CACHE_FILE
         self.index_state_path = self.vector_dir / "index_state.json"
 
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.chunks_dir.mkdir(parents=True, exist_ok=True)
         self.vector_dir.mkdir(parents=True, exist_ok=True)
         if not self.profile_path.exists():
             self.profile_path.touch()
         if not self.projects_path.exists():
             self.projects_path.touch()
+        if not self.records_path.exists():
+            self.records_path.write_text(json.dumps(self._default_records_payload(), ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        if not self.entities_path.exists():
+            self.entities_path.write_text(json.dumps(self._default_entities_payload(), ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        if not self.daily_summary_path.exists():
+            self.daily_summary_path.write_text(json.dumps({}, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
         self._embedder = None
         self._collection = None
         self._vector_disabled = False
         self._embedder_disabled = False
+        self._daily_summary_cache: tuple[str, str] | None = None
+        self._bootstrap_memory_store()
         self.ensure_index_current()
+
+    def remember(
+        self,
+        text: str,
+        brain: Any | None = None,
+        *,
+        source: str = "explicit",
+    ) -> dict[str, Any]:
+        cleaned = str(text).strip()
+        if not cleaned:
+            return {"ok": False, "stored": 0, "items": [], "error": "No memory text provided."}
+
+        items = self._analyze_explicit_memory(cleaned, brain)
+        stored_records = self._upsert_memory_items(items, source_type=source, explicit=True)
+        self._rebuild_materialized_memory(stored_records_changed=True)
+        return {
+            "ok": True,
+            "stored": len(stored_records),
+            "items": [record["text"] for record in stored_records],
+        }
+
+    def forget(self, query: str, limit: int | None = None) -> dict[str, Any]:
+        cleaned = str(query).strip()
+        if not cleaned:
+            return {"ok": False, "deleted": 0, "items": [], "error": "No forget query provided."}
+
+        records_payload = self._load_records_payload()
+        records = records_payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
+
+        matches = self._match_records_for_forget(cleaned, records, limit or self.settings.memory_top_k)
+        if not matches:
+            return {"ok": True, "deleted": 0, "items": []}
+
+        delete_ids = {match["id"] for match in matches}
+        updated_records = [record for record in records if str(record.get("id", "")) not in delete_ids]
+        records_payload["records"] = updated_records
+        records_payload["updated_at"] = self._now_iso()
+        self._save_records_payload(records_payload)
+        self._rebuild_materialized_memory(stored_records_changed=True)
+        return {
+            "ok": True,
+            "deleted": len(matches),
+            "items": [match["text"] for match in matches],
+        }
+
+    def entity_lookup(self, query: str, limit: int | None = None) -> dict[str, Any]:
+        cleaned = str(query).strip()
+        if not cleaned:
+            return {"ok": False, "entities": [], "error": "No entity query provided."}
+
+        entities_payload = self._load_entities_payload()
+        entities = entities_payload.get("entities", {})
+        if not isinstance(entities, dict):
+            entities = {}
+
+        query_tokens = self._normalized_tokens(cleaned)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for entity in entities.values():
+            if not isinstance(entity, dict):
+                continue
+            candidate_bits = [str(entity.get("name", ""))]
+            candidate_bits.extend(str(alias) for alias in entity.get("aliases", []) if alias)
+            candidate_bits.extend(str(fact) for fact in entity.get("facts", []) if fact)
+            candidate_text = " ".join(candidate_bits)
+            score = self._token_overlap_score(" ".join(query_tokens), candidate_text)
+            if score > 0:
+                scored.append((score, entity))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        selected = [entity for _, entity in scored[: (limit or self.settings.memory_top_k)]]
+        return {"ok": True, "entities": selected}
+
+    def get_daily_context_summary(self, brain: Any | None = None) -> str:
+        today = datetime.now().date().isoformat()
+        if self._daily_summary_cache and self._daily_summary_cache[0] == today:
+            return self._daily_summary_cache[1]
+
+        payload = self._safe_json(self.daily_summary_path.read_text(encoding="utf-8")) or {}
+        if (
+            isinstance(payload, dict)
+            and payload.get("date") == today
+            and payload.get("source_signature") == self._daily_summary_source_signature()
+        ):
+            summary = str(payload.get("summary", "")).strip()
+            self._daily_summary_cache = (today, summary)
+            return summary
+
+        summary = self._build_daily_context_summary(brain)
+        cache_payload = {
+            "date": today,
+            "summary": summary,
+            "source_signature": self._daily_summary_source_signature(),
+            "updated_at": self._now_iso(),
+        }
+        self.daily_summary_path.write_text(
+            json.dumps(cache_payload, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self._daily_summary_cache = (today, summary)
+        return summary
 
     def recall(self, query: str, limit: int | None = None) -> list[str]:
         limit = limit or self.settings.memory_top_k
         lowered = query.lower()
         query_variants = self._query_variants(query)
+        record_payload = self._load_records_payload()
+        records = record_payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
+        active_records = [record for record in records if record.get("active", True)]
+        entity_candidates = self._entity_candidates(query)
+        record_modifiers = self._record_text_modifiers(active_records)
+        recent_candidates = self._merge_unique(
+            self._recent_session_candidates(),
+            self._recent_log_candidates(),
+        )
+        recent_query = self._is_recent_conversation_query(lowered)
+        if recent_query and recent_candidates:
+            recent_ranked, recent_best = self._rank_candidates(query_variants, recent_candidates)
+            if recent_ranked and recent_best >= 0.05:
+                if len(recent_ranked) >= limit:
+                    return recent_ranked[:limit]
+                supplemental_ranked, _ = self._rank_candidates(
+                    query_variants,
+                    self._merge_unique(
+                        self._candidate_pool(include_chunks=True),
+                        entity_candidates,
+                    ),
+                    score_modifiers=record_modifiers,
+                )
+                return self._merge_unique(recent_ranked, supplemental_ranked)[:limit]
+
         if any(marker in lowered for marker in ("know about me", "remember about me", "who am i", "my profile")):
-            profile_items = self._candidate_pool(include_chunks=False)
-            vector_hits = self._merge_unique(
+            profile_items = self._merge_unique(self._candidate_pool(include_chunks=False), entity_candidates)
+            vector_hit_records = self._merge_unique_records(
                 *[self._query_vector_store(variant, limit * 2) for variant in query_variants]
             )
+            vector_hits = [item["text"] for item in vector_hit_records]
             ranked, _ = self._rank_candidates(
                 query_variants,
                 self._merge_unique(profile_items, vector_hits),
                 vector_hits=set(vector_hits),
+                score_modifiers=record_modifiers,
             )
+            self._mark_records_retrieved(ranked[:limit], records)
             return ranked[:limit]
 
+        summary_candidates = self._merge_unique(self._candidate_pool(include_chunks=False), entity_candidates)
+        if recent_query:
+            summary_candidates = self._merge_unique(recent_candidates, summary_candidates)
         summary_ranked, summary_best = self._rank_candidates(
             query_variants,
-            self._candidate_pool(include_chunks=False),
+            summary_candidates,
+            score_modifiers=record_modifiers,
         )
         if summary_ranked and summary_best >= 0.18:
+            self._mark_records_retrieved(summary_ranked[:limit], records)
             return summary_ranked[:limit]
 
-        full_candidates = self._candidate_pool(include_chunks=True)
-        vector_hits = self._merge_unique(
+        full_candidates = self._merge_unique(self._candidate_pool(include_chunks=True), entity_candidates)
+        if recent_candidates:
+            full_candidates = self._merge_unique(recent_candidates, full_candidates)
+        vector_hit_records = self._merge_unique_records(
             *[self._query_vector_store(variant, limit * 2) for variant in query_variants]
         )
+        vector_hits = [item["text"] for item in vector_hit_records]
         ranked, best_score = self._rank_candidates(
             query_variants,
             self._merge_unique(full_candidates, vector_hits),
             vector_hits=set(vector_hits),
+            score_modifiers=record_modifiers,
         )
         if ranked and (best_score >= 0.08 or vector_hits):
+            self._mark_records_retrieved(ranked[:limit], records)
             return ranked[:limit]
 
         fallback_hits, _ = self._fast_recall(query_variants[0], limit, include_chunks=True)
+        self._mark_records_retrieved(fallback_hits, records)
         return fallback_hits
 
     def persist_conversation(
@@ -89,12 +256,14 @@ class Memory:
         assistant_message: str,
         conversation: list[dict[str, Any]],
         tool_trace: list[dict[str, Any]],
+        session_id: str | None = None,
         brain: Any | None = None,
         should_extract: bool = True,
         background: bool = False,
     ) -> dict[str, Any]:
         self._log_message("user", user_message, tool_trace)
         self._log_message("assistant", assistant_message, tool_trace)
+        self._append_session_turns(session_id, user_message, assistant_message, tool_trace)
 
         if not should_extract:
             return {"stored": 0, "chunks": []}
@@ -118,12 +287,69 @@ class Memory:
         if not extracted_items:
             return {"stored": 0, "chunks": []}
 
-        chunk_lines = [f"[{item['tag']}] {item['text']}" for item in extracted_items]
+        stored_records = self._upsert_memory_items(
+            extracted_items,
+            source_type="conversation_extract",
+            explicit=False,
+        )
+        if not stored_records:
+            return {"stored": 0, "chunks": []}
+
+        chunk_lines = [
+            f"[{record['tag']}] {record['text']} | confidence={record['confidence']} importance={record['importance']}"
+            for record in stored_records
+        ]
         chunk_path = self._append_chunk(chunk_lines)
-        self._update_summary_docs(extracted_items)
-        self._index_memories(extracted_items)
-        self._write_index_state()
-        return {"stored": len(extracted_items), "chunks": [str(chunk_path)]}
+        self._rebuild_materialized_memory(stored_records_changed=True)
+        return {"stored": len(stored_records), "chunks": [str(chunk_path)]}
+
+    def load_recent_messages(self, limit_messages: int = 12) -> list[dict[str, str]]:
+        collected: list[dict[str, str]] = []
+        for session_file in self._recent_session_files():
+            payload = self._load_session_payload(session_file)
+            messages = payload.get("messages", [])
+            if not isinstance(messages, list):
+                continue
+            for message in reversed(messages):
+                if len(collected) >= limit_messages:
+                    break
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role", "")).strip().lower()
+                content = str(message.get("content", "")).strip()
+                if role not in {"user", "assistant"} or not content:
+                    continue
+                collected.append({"role": role, "content": content})
+            if len(collected) >= limit_messages:
+                break
+        if not collected:
+            return self._recent_log_messages(limit_messages)
+        collected.reverse()
+        return collected
+
+    def load_session_messages(self, session_id: str, limit_messages: int = 12) -> list[dict[str, str]]:
+        if not session_id:
+            return self.load_recent_messages(limit_messages)
+
+        session_path = self.sessions_dir / f"session_{session_id}.json"
+        payload = self._load_session_payload(session_path)
+        messages = payload.get("messages", [])
+        if not isinstance(messages, list):
+            return self.load_recent_messages(limit_messages)
+
+        collected: list[dict[str, str]] = []
+        for message in reversed(messages):
+            if len(collected) >= limit_messages:
+                break
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).strip().lower()
+            content = str(message.get("content", "")).strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            collected.append({"role": role, "content": content})
+        collected.reverse()
+        return collected
 
     def ensure_index_current(self) -> None:
         current_state = self._memory_source_state()
@@ -141,7 +367,7 @@ class Memory:
         documents = [item["text"] for item in items]
         embeddings = embedder.encode(documents).tolist()
         collection.add(
-            ids=[f"memory_{uuid.uuid4().hex}" for _ in items],
+            ids=[str(item.get("id", "")).strip() or f"memory_{uuid.uuid4().hex}" for item in items],
             documents=documents,
             embeddings=embeddings,
             metadatas=[
@@ -149,6 +375,7 @@ class Memory:
                     "tag": item["tag"],
                     "created_at": datetime.now().isoformat(),
                     "source": item.get("source", "disk"),
+                    "record_id": str(item.get("id", "")).strip(),
                 }
                 for item in items
             ],
@@ -181,11 +408,58 @@ class Memory:
             handle.write("\n")
         return chunk_path
 
+    def _append_session_turns(
+        self,
+        session_id: str | None,
+        user_message: str,
+        assistant_message: str,
+        tool_trace: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if not session_id:
+            return
+
+        session_path = self.sessions_dir / f"session_{session_id}.json"
+        payload = self._load_session_payload(session_path)
+        messages = payload.get("messages", [])
+        if not isinstance(messages, list):
+            messages = []
+
+        timestamp = datetime.now().isoformat()
+        tool_names = [item.get("name") for item in (tool_trace or []) if item.get("name")]
+        if user_message.strip():
+            messages.append(
+                {
+                    "timestamp": timestamp,
+                    "role": "user",
+                    "content": user_message.strip(),
+                }
+            )
+        if assistant_message.strip():
+            messages.append(
+                {
+                    "timestamp": timestamp,
+                    "role": "assistant",
+                    "content": assistant_message.strip(),
+                    "tools_used": tool_names,
+                }
+            )
+
+        session_payload = {
+            "session_id": session_id,
+            "created_at": payload.get("created_at") or timestamp,
+            "updated_at": timestamp,
+            "messages": messages,
+        }
+        session_path.write_text(
+            json.dumps(session_payload, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+
     def _extract_memories(
         self,
         conversation: list[dict[str, Any]],
         brain: Any | None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         transcript = []
         for message in conversation:
             role = message.get("role", "unknown").upper()
@@ -198,9 +472,15 @@ class Memory:
 
         if brain is not None:
             extraction_prompt = (
-                "You extract durable memory from a conversation.\n"
-                "Return strict JSON with keys PERSONAL, PROJECT, FACT.\n"
-                "Each value must be a list of short factual strings worth remembering.\n"
+                "You extract durable user memory from a conversation.\n"
+                "Return strict JSON with one top-level key: items.\n"
+                "items must be a list of objects with keys: tag, text, memory_key, confidence, importance, entities, relations.\n"
+                "tag must be PERSONAL, PROJECT, or FACT.\n"
+                "text must be a short factual memory worth storing.\n"
+                "memory_key must be a stable canonical slot name if the memory can overwrite older conflicting facts.\n"
+                "confidence and importance must be integers 1-10.\n"
+                "entities must be a list of objects with keys name and type.\n"
+                "relations must be a list of objects with keys source, predicate, target.\n"
                 "Only include information that should persist beyond this conversation."
             )
             response = brain.chat(
@@ -217,8 +497,17 @@ class Memory:
 
         return self._fallback_extract(transcript)
 
-    def _normalize_extraction_payload(self, payload: dict[str, Any]) -> list[dict[str, str]]:
-        items: list[dict[str, str]] = []
+    def _normalize_extraction_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        raw_items = payload.get("items")
+        if isinstance(raw_items, list):
+            for raw_item in raw_items:
+                normalized = self._normalize_memory_item(raw_item)
+                if normalized is not None:
+                    items.append(normalized)
+        if items:
+            return items
+
         for tag in ("PERSONAL", "PROJECT", "FACT"):
             values = payload.get(tag, [])
             if not isinstance(values, list):
@@ -226,76 +515,591 @@ class Memory:
             for value in values:
                 text = str(value).strip()
                 if text:
-                    items.append({"tag": tag, "text": text})
+                    items.append(
+                        {
+                            "tag": tag,
+                            "text": text,
+                            "memory_key": self._default_memory_key(tag, text),
+                            "confidence": 8,
+                            "importance": 8,
+                            "entities": self._extract_entities_fallback(text),
+                            "relations": [],
+                        }
+                    )
         return items
 
-    def _fallback_extract(self, transcript: list[str]) -> list[dict[str, str]]:
-        items: list[dict[str, str]] = []
+    def _fallback_extract(self, transcript: list[str]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
         for line in transcript:
             lowered = line.lower()
             if not lowered.startswith("USER:"):
                 continue
             content = line[6:].strip()
             if any(marker in lowered for marker in ("i am ", "my ", "i like ", "remember ")):
-                items.append({"tag": "PERSONAL", "text": content})
+                items.append(
+                    {
+                        "tag": "PERSONAL",
+                        "text": content,
+                        "memory_key": self._default_memory_key("PERSONAL", content),
+                        "confidence": 6,
+                        "importance": 7,
+                        "entities": self._extract_entities_fallback(content),
+                        "relations": [],
+                    }
+                )
             elif any(marker in lowered for marker in ("project", "build", "working on", "jarvis")):
-                items.append({"tag": "PROJECT", "text": content})
+                items.append(
+                    {
+                        "tag": "PROJECT",
+                        "text": content,
+                        "memory_key": self._default_memory_key("PROJECT", content),
+                        "confidence": 6,
+                        "importance": 7,
+                        "entities": self._extract_entities_fallback(content),
+                        "relations": [],
+                    }
+                )
         return items
 
-    def _update_summary_docs(self, items: list[dict[str, str]]) -> None:
-        personal_lines = [item["text"] for item in items if item["tag"] == "PERSONAL"]
-        project_lines = [item["text"] for item in items if item["tag"] == "PROJECT"]
-        if personal_lines:
-            self._rewrite_summary_file(self.profile_path, "## User Profile", personal_lines)
-        if project_lines:
-            self._rewrite_summary_file(self.projects_path, "## Active Projects", project_lines)
+    def _default_records_payload(self) -> dict[str, Any]:
+        return {"version": 2, "updated_at": self._now_iso(), "records": []}
 
-    def _rewrite_summary_file(self, path: Path, title: str, new_lines: list[str]) -> None:
-        existing_lines: list[str] = []
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                cleaned = line.strip()
-                if not cleaned or cleaned.startswith("#"):
-                    continue
-                if cleaned.startswith("- "):
-                    existing_lines.append(cleaned[2:].strip())
-                else:
-                    existing_lines.append(cleaned)
+    def _default_entities_payload(self) -> dict[str, Any]:
+        return {"version": 1, "updated_at": self._now_iso(), "entities": {}}
 
-        merged = []
-        seen = set()
-        for line in existing_lines + new_lines:
-            cleaned = line.strip()
-            if cleaned and cleaned not in seen:
-                seen.add(cleaned)
-                merged.append(cleaned)
+    def _bootstrap_memory_store(self) -> None:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
+        if not records:
+            records = self._migrate_legacy_files_to_records()
+            payload["records"] = records
+            payload["updated_at"] = self._now_iso()
+            self._save_records_payload(payload)
+        else:
+            records = self._sync_external_memory_files(records)
+            records = self._apply_memory_decay(records)
+            payload["records"] = records
+            payload["updated_at"] = self._now_iso()
+            self._save_records_payload(payload)
+        self._rebuild_entities(records)
+        self._rewrite_summary_docs_from_records(records)
 
-        output = [title, ""]
-        output.extend(f"- {line}" for line in merged)
-        path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    def _load_records_payload(self) -> dict[str, Any]:
+        payload = self._safe_json(self.records_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(payload, dict):
+            return self._default_records_payload()
+        payload.setdefault("records", [])
+        return payload
 
-    def _index_memories(self, items: list[dict[str, str]]) -> None:
-        collection = self._get_collection()
-        embedder = self._get_embedder()
-        if collection is None or embedder is None:
-            return
-
-        documents = [item["text"] for item in items]
-        embeddings = embedder.encode(documents).tolist()
-        collection.add(
-            ids=[f"memory_{uuid.uuid4().hex}" for _ in items],
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=[
-                {
-                    "tag": item["tag"],
-                    "created_at": datetime.now().isoformat(),
-                }
-                for item in items
-            ],
+    def _save_records_payload(self, payload: dict[str, Any]) -> None:
+        self.records_path.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
         )
 
-    def _query_vector_store(self, query: str, limit: int) -> list[str]:
+    def _load_entities_payload(self) -> dict[str, Any]:
+        payload = self._safe_json(self.entities_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(payload, dict):
+            return self._default_entities_payload()
+        payload.setdefault("entities", {})
+        return payload
+
+    def _save_entities_payload(self, payload: dict[str, Any]) -> None:
+        self.entities_path.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _now_iso(self) -> str:
+        return datetime.now().astimezone().isoformat()
+
+    def _coerce_score(self, value: Any, default: int = 7) -> int:
+        try:
+            score = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(1, min(score, 10))
+
+    def _sanitize_tag(self, value: Any) -> str:
+        tag = str(value or "FACT").strip().upper()
+        return tag if tag in {"PERSONAL", "PROJECT", "FACT"} else "FACT"
+
+    def _default_memory_key(self, tag: str, text: str) -> str:
+        normalized = " ".join(self._normalized_tokens(text)) or re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+        key_basis = "-".join(normalized.split()[:6]) or uuid.uuid4().hex[:12]
+        return f"{tag.lower()}.{key_basis}"
+
+    def _normalize_memory_item(self, raw_item: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_item, dict):
+            return None
+        text = str(raw_item.get("text", "")).strip()
+        if not text:
+            return None
+        tag = self._sanitize_tag(raw_item.get("tag"))
+        entities = raw_item.get("entities", [])
+        relations = raw_item.get("relations", [])
+        if not isinstance(entities, list):
+            entities = []
+        if not isinstance(relations, list):
+            relations = []
+        normalized_entities = []
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            name = str(entity.get("name", "")).strip()
+            if not name:
+                continue
+            normalized_entities.append(
+                {
+                    "name": name,
+                    "type": str(entity.get("type", "UNKNOWN")).strip().upper() or "UNKNOWN",
+                }
+            )
+        if not normalized_entities:
+            normalized_entities = self._extract_entities_fallback(text)
+        normalized_relations = []
+        for relation in relations:
+            if not isinstance(relation, dict):
+                continue
+            source = str(relation.get("source", "")).strip()
+            predicate = str(relation.get("predicate", "")).strip()
+            target = str(relation.get("target", "")).strip()
+            if source and predicate and target:
+                normalized_relations.append(
+                    {"source": source, "predicate": predicate, "target": target}
+                )
+        return {
+            "tag": tag,
+            "text": text,
+            "memory_key": str(raw_item.get("memory_key", "")).strip() or self._default_memory_key(tag, text),
+            "confidence": self._coerce_score(raw_item.get("confidence"), 7),
+            "importance": self._coerce_score(raw_item.get("importance"), 7),
+            "entities": normalized_entities,
+            "relations": normalized_relations,
+        }
+
+    def _extract_entities_fallback(self, text: str) -> list[dict[str, str]]:
+        entities: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for match in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", text):
+            name = match.group(1).strip()
+            lowered = name.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            entities.append({"name": name, "type": "UNKNOWN"})
+        return entities
+
+    def _analyze_explicit_memory(self, text: str, brain: Any | None) -> list[dict[str, Any]]:
+        if brain is not None:
+            prompt = (
+                "You are storing an explicit user memory.\n"
+                "Return strict JSON with key items, where items is a list of memory objects.\n"
+                "Each memory object must contain tag, text, memory_key, confidence, importance, entities, relations.\n"
+                "confidence and importance must both be 10 unless the statement is ambiguous.\n"
+                "Preserve the user's meaning exactly."
+            )
+            response = brain.chat(
+                messages=[{"role": "user", "content": text}],
+                task_kind="memory",
+                response_format="json",
+                system_override=prompt,
+            )
+            payload = self._safe_json(response.get("content", ""))
+            if isinstance(payload, dict):
+                normalized = self._normalize_extraction_payload(payload)
+                if normalized:
+                    return normalized
+
+        return [
+            {
+                "tag": "FACT",
+                "text": text,
+                "memory_key": self._default_memory_key("FACT", text),
+                "confidence": 10,
+                "importance": 10,
+                "entities": self._extract_entities_fallback(text),
+                "relations": [],
+            }
+        ]
+
+    def _migrate_legacy_files_to_records(self) -> list[dict[str, Any]]:
+        items = self._legacy_disk_items()
+        records: list[dict[str, Any]] = []
+        seen_texts: set[str] = set()
+        for item in items:
+            normalized = self._normalize_memory_item(item)
+            if normalized is None or normalized["text"] in seen_texts:
+                continue
+            seen_texts.add(normalized["text"])
+            records.append(
+                {
+                    "id": f"memory_{uuid.uuid4().hex}",
+                    **normalized,
+                    "active": True,
+                    "demoted": False,
+                    "explicit": item.get("source_type") == "manual_file",
+                    "source_type": item.get("source_type", "legacy_import"),
+                    "source_ref": item.get("source_ref", ""),
+                    "created_at": self._now_iso(),
+                    "updated_at": self._now_iso(),
+                    "last_retrieved_at": None,
+                    "retrieval_count": 0,
+                    "superseded_by": None,
+                }
+            )
+        return records
+
+    def _sync_external_memory_files(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        known_texts = {str(record.get("text", "")).strip() for record in records}
+        for item in self._legacy_disk_items():
+            normalized = self._normalize_memory_item(item)
+            if normalized is None or normalized["text"] in known_texts:
+                continue
+            known_texts.add(normalized["text"])
+            records.append(
+                {
+                    "id": f"memory_{uuid.uuid4().hex}",
+                    **normalized,
+                    "active": True,
+                    "demoted": False,
+                    "explicit": item.get("source_type") == "manual_file",
+                    "source_type": item.get("source_type", "manual_file"),
+                    "source_ref": item.get("source_ref", ""),
+                    "created_at": self._now_iso(),
+                    "updated_at": self._now_iso(),
+                    "last_retrieved_at": None,
+                    "retrieval_count": 0,
+                    "superseded_by": None,
+                }
+            )
+        return records
+
+    def _legacy_disk_items(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        items.extend(
+            {
+                "tag": "PERSONAL",
+                "text": line,
+                "memory_key": self._default_memory_key("PERSONAL", line),
+                "confidence": 9,
+                "importance": 9,
+                "entities": self._extract_entities_fallback(line),
+                "relations": [],
+                "source_type": "manual_file",
+                "source_ref": str(self.profile_path),
+            }
+            for line in self._summary_candidates_from_file(self.profile_path)
+        )
+        items.extend(
+            {
+                "tag": "PROJECT",
+                "text": line,
+                "memory_key": self._default_memory_key("PROJECT", line),
+                "confidence": 9,
+                "importance": 9,
+                "entities": self._extract_entities_fallback(line),
+                "relations": [],
+                "source_type": "manual_file",
+                "source_ref": str(self.projects_path),
+            }
+            for line in self._summary_candidates_from_file(self.projects_path)
+        )
+        for chunk_file in sorted(self.chunks_dir.glob("*.txt")):
+            for item in self._chunk_items_from_file(chunk_file):
+                items.append(
+                    {
+                        **item,
+                        "memory_key": self._default_memory_key(item["tag"], item["text"]),
+                        "confidence": 8,
+                        "importance": 8,
+                        "entities": self._extract_entities_fallback(item["text"]),
+                        "relations": [],
+                        "source_type": "legacy_chunk",
+                        "source_ref": str(chunk_file),
+                    }
+                )
+        return items
+
+    def _upsert_memory_items(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        source_type: str,
+        explicit: bool,
+    ) -> list[dict[str, Any]]:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
+
+        accepted_records: list[dict[str, Any]] = []
+        for item in items:
+            normalized = self._normalize_memory_item(item)
+            if normalized is None:
+                continue
+            if not explicit and normalized["confidence"] < self.settings.memory_confidence_threshold:
+                continue
+
+            existing_exact = next(
+                (
+                    record for record in records
+                    if str(record.get("text", "")).strip() == normalized["text"]
+                    and str(record.get("memory_key", "")).strip() == normalized["memory_key"]
+                ),
+                None,
+            )
+            if existing_exact is not None:
+                existing_exact["confidence"] = max(int(existing_exact.get("confidence", 0)), normalized["confidence"])
+                existing_exact["importance"] = max(int(existing_exact.get("importance", 0)), normalized["importance"])
+                existing_exact["entities"] = normalized["entities"]
+                existing_exact["relations"] = normalized["relations"]
+                existing_exact["active"] = True
+                existing_exact["demoted"] = False
+                existing_exact["updated_at"] = self._now_iso()
+                accepted_records.append(existing_exact)
+                continue
+
+            new_id = f"memory_{uuid.uuid4().hex}"
+            for record in records:
+                if (
+                    record.get("active", True)
+                    and str(record.get("memory_key", "")).strip()
+                    and str(record.get("memory_key", "")).strip() == normalized["memory_key"]
+                    and str(record.get("text", "")).strip() != normalized["text"]
+                ):
+                    record["active"] = False
+                    record["demoted"] = True
+                    record["superseded_by"] = new_id
+                    record["updated_at"] = self._now_iso()
+
+            new_record = {
+                "id": new_id,
+                **normalized,
+                "active": True,
+                "demoted": False,
+                "explicit": explicit,
+                "source_type": source_type,
+                "source_ref": "",
+                "created_at": self._now_iso(),
+                "updated_at": self._now_iso(),
+                "last_retrieved_at": None,
+                "retrieval_count": 0,
+                "superseded_by": None,
+            }
+            records.append(new_record)
+            accepted_records.append(new_record)
+
+        payload["records"] = self._apply_memory_decay(records)
+        payload["updated_at"] = self._now_iso()
+        self._save_records_payload(payload)
+        return accepted_records
+
+    def _apply_memory_decay(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cutoff = datetime.now().astimezone() - timedelta(days=self.settings.memory_decay_days)
+        for record in records:
+            if not record.get("active", True):
+                continue
+            if record.get("explicit"):
+                continue
+            last_retrieved_at = record.get("last_retrieved_at") or record.get("updated_at") or record.get("created_at")
+            try:
+                last_seen = datetime.fromisoformat(str(last_retrieved_at))
+            except ValueError:
+                continue
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.astimezone()
+            if last_seen < cutoff and int(record.get("retrieval_count", 0)) == 0:
+                record["demoted"] = True
+        return records
+
+    def _rebuild_materialized_memory(self, *, stored_records_changed: bool) -> None:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
+        records = self._apply_memory_decay(records)
+        payload["records"] = records
+        payload["updated_at"] = self._now_iso()
+        self._save_records_payload(payload)
+        self._rebuild_entities(records)
+        self._rewrite_summary_docs_from_records(records)
+        if stored_records_changed:
+            with contextlib.suppress(OSError):
+                self.index_state_path.unlink()
+        self.ensure_index_current()
+
+    def _rewrite_summary_docs_from_records(self, records: list[dict[str, Any]]) -> None:
+        personal_lines = [
+            str(record.get("text", "")).strip()
+            for record in records
+            if record.get("active", True) and self._sanitize_tag(record.get("tag")) == "PERSONAL"
+        ]
+        project_lines = [
+            str(record.get("text", "")).strip()
+            for record in records
+            if record.get("active", True) and self._sanitize_tag(record.get("tag")) == "PROJECT"
+        ]
+        self._rewrite_summary_file(self.profile_path, "## User Profile", personal_lines)
+        self._rewrite_summary_file(self.projects_path, "## Active Projects", project_lines)
+
+    def _rewrite_summary_file(self, path: Path, title: str, lines: list[str]) -> None:
+        unique_lines = self._merge_unique(lines)
+        output = [title, ""]
+        output.extend(f"- {line}" for line in unique_lines)
+        path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+    def _rebuild_entities(self, records: list[dict[str, Any]]) -> None:
+        entities: dict[str, dict[str, Any]] = {}
+        for record in records:
+            if not record.get("active", True):
+                continue
+            record_id = str(record.get("id", ""))
+            facts = [str(record.get("text", "")).strip()]
+            for entity in record.get("entities", []) or []:
+                if not isinstance(entity, dict):
+                    continue
+                name = str(entity.get("name", "")).strip()
+                if not name:
+                    continue
+                slug = self._entity_slug(name)
+                node = entities.setdefault(
+                    slug,
+                    {
+                        "name": name,
+                        "type": str(entity.get("type", "UNKNOWN")).strip().upper() or "UNKNOWN",
+                        "aliases": [name],
+                        "facts": [],
+                        "memory_ids": [],
+                        "relations": [],
+                    },
+                )
+                if name not in node["aliases"]:
+                    node["aliases"].append(name)
+                if record_id and record_id not in node["memory_ids"]:
+                    node["memory_ids"].append(record_id)
+                for fact in facts:
+                    if fact and fact not in node["facts"]:
+                        node["facts"].append(fact)
+            for relation in record.get("relations", []) or []:
+                if not isinstance(relation, dict):
+                    continue
+                source_name = str(relation.get("source", "")).strip()
+                predicate = str(relation.get("predicate", "")).strip()
+                target_name = str(relation.get("target", "")).strip()
+                if not (source_name and predicate and target_name):
+                    continue
+                source_node = entities.setdefault(
+                    self._entity_slug(source_name),
+                    {
+                        "name": source_name,
+                        "type": "UNKNOWN",
+                        "aliases": [source_name],
+                        "facts": [],
+                        "memory_ids": [],
+                        "relations": [],
+                    },
+                )
+                relation_payload = {
+                    "predicate": predicate,
+                    "target": target_name,
+                    "memory_id": record_id,
+                }
+                if relation_payload not in source_node["relations"]:
+                    source_node["relations"].append(relation_payload)
+
+        payload = self._default_entities_payload()
+        payload["updated_at"] = self._now_iso()
+        payload["entities"] = entities
+        self._save_entities_payload(payload)
+
+    def _entity_slug(self, name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or uuid.uuid4().hex[:8]
+
+    def _build_daily_context_summary(self, brain: Any | None) -> str:
+        profile_lines = self._summary_candidates_from_file(self.profile_path)
+        project_lines = self._summary_candidates_from_file(self.projects_path)
+        if not profile_lines and not project_lines:
+            return ""
+
+        context_block = [
+            "Profile:",
+            *[f"- {line}" for line in profile_lines[:10]],
+            "",
+            "Projects:",
+            *[f"- {line}" for line in project_lines[:10]],
+        ]
+        if brain is not None:
+            prompt = (
+                "Create a concise 2-sentence internal summary of this user's durable context.\n"
+                "Focus on identity, location, preferences, and active project direction.\n"
+                "Do not mention that this is a summary."
+            )
+            response = brain.chat(
+                messages=[{"role": "user", "content": "\n".join(context_block)}],
+                task_kind="memory",
+                system_override=prompt,
+            )
+            summary = str(response.get("content", "")).strip()
+            if summary:
+                return summary
+
+        blended = self._merge_unique(profile_lines[:2], project_lines[:2])
+        if not blended:
+            return ""
+        return " ".join(blended[:2])
+
+    def _daily_summary_source_signature(self) -> str:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
+        active_records = [
+            {
+                "id": record.get("id"),
+                "updated_at": record.get("updated_at"),
+                "text": record.get("text"),
+            }
+            for record in records
+            if record.get("active", True)
+        ]
+        return json.dumps(active_records, ensure_ascii=True, sort_keys=True)
+
+    def _match_records_for_forget(
+        self,
+        query: str,
+        records: list[dict[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        candidates = [record for record in records if record.get("active", True)]
+        scored: list[tuple[float, dict[str, Any]]] = []
+        query_lower = query.lower().strip()
+        query_tokens = self._normalized_tokens(query)
+        for record in candidates:
+            text = str(record.get("text", "")).strip()
+            lowered_text = text.lower()
+            overlap_score = self._token_overlap_score(query, text)
+            sequence_score = difflib.SequenceMatcher(None, query_lower, lowered_text).ratio()
+            contains_query = query_lower in lowered_text
+            candidate_tokens = self._normalized_tokens(text)
+            token_fraction = (
+                len(query_tokens & candidate_tokens) / len(query_tokens)
+                if query_tokens else 0.0
+            )
+            score = max(overlap_score, sequence_score)
+            if contains_query:
+                score += 0.5
+            if token_fraction >= 0.9:
+                score += 0.25
+            is_long_query = len(query_tokens) >= 4
+            if contains_query or (is_long_query and sequence_score >= 0.86) or (not is_long_query and sequence_score >= 0.72) or token_fraction >= (0.9 if is_long_query else 0.8):
+                scored.append((score, record))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [record for _, record in scored[:limit]]
+
+    def _query_vector_store(self, query: str, limit: int) -> list[dict[str, Any]]:
         collection = self._get_collection()
         embedder = self._get_embedder()
         if collection is None or embedder is None:
@@ -305,14 +1109,17 @@ class Memory:
             query_embeddings=embedder.encode([query]).tolist(),
             n_results=limit,
         )
+        ids = results.get("ids", [])
         documents = results.get("documents", [])
-        if not documents:
+        metadatas = results.get("metadatas", [])
+        if not documents or not ids:
             return []
-        return [doc for doc in documents[0] if isinstance(doc, str)]
-
-    def _fallback_recall(self, query: str, limit: int) -> list[str]:
-        hits, _ = self._fast_recall(query, limit, include_chunks=True)
-        return hits
+        rows: list[dict[str, Any]] = []
+        metadata_rows = metadatas[0] if metadatas else [None] * len(documents[0])
+        for item_id, doc, metadata in zip(ids[0], documents[0], metadata_rows):
+            if isinstance(doc, str):
+                rows.append({"id": item_id, "text": doc, "metadata": metadata or {}})
+        return rows
 
     def _summary_candidates_from_file(self, path: Path) -> list[str]:
         candidates: list[str] = []
@@ -381,16 +1188,10 @@ class Memory:
 
     def _memory_vocabulary(self) -> set[str]:
         vocab: set[str] = set()
-        candidates: list[str] = []
-        for path in [self.profile_path, self.projects_path]:
-            if path.exists():
-                candidates.extend(self._summary_candidates_from_file(path))
-        for chunk_file in sorted(self.chunks_dir.glob("*.txt"), reverse=True):
-            candidates.extend(
-                line.strip()
-                for line in chunk_file.read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.startswith("[")
-            )
+        candidates = self._merge_unique(
+            self._candidate_pool(include_chunks=True),
+            self._entity_candidates(""),
+        )
         for candidate in candidates:
             for token in re.findall(r"[a-zA-Z0-9]+", candidate.lower()):
                 normalized = self._normalize_token(token)
@@ -410,11 +1211,34 @@ class Memory:
                 merged.append(cleaned)
         return merged
 
+    def _merge_unique_records(self, *groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for group in groups:
+            for item in group:
+                if not isinstance(item, dict):
+                    continue
+                identity = str(item.get("id", "")).strip() or str(item.get("text", "")).strip()
+                if not identity or identity in seen:
+                    continue
+                seen.add(identity)
+                merged.append(item)
+        return merged
+
     def _candidate_pool(self, include_chunks: bool) -> list[str]:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
         candidates: list[str] = []
-        for path in [self.profile_path, self.projects_path]:
-            if path.exists():
-                candidates.extend(self._summary_candidates_from_file(path))
+        for record in records:
+            if not record.get("active", True):
+                continue
+            if not include_chunks and self._sanitize_tag(record.get("tag")) == "FACT":
+                continue
+            text = str(record.get("text", "")).strip()
+            if text:
+                candidates.append(text)
         if include_chunks:
             for chunk_file in sorted(self.chunks_dir.glob("*.txt"), reverse=True):
                 candidates.extend(
@@ -422,20 +1246,243 @@ class Memory:
                     for line in chunk_file.read_text(encoding="utf-8").splitlines()
                     if line.strip() and not line.startswith("[")
                 )
-        return candidates
+        return self._merge_unique(candidates)
+
+    def _entity_candidates(self, query: str) -> list[str]:
+        payload = self._load_entities_payload()
+        entities = payload.get("entities", {})
+        if not isinstance(entities, dict):
+            return []
+        query_tokens = self._normalized_tokens(query)
+        candidates: list[str] = []
+        for entity in entities.values():
+            if not isinstance(entity, dict):
+                continue
+            search_blob = " ".join(
+                [
+                    str(entity.get("name", "")).strip(),
+                    *[str(alias).strip() for alias in entity.get("aliases", []) if alias],
+                    *[str(fact).strip() for fact in entity.get("facts", []) if fact],
+                ]
+            )
+            if query_tokens and self._token_overlap_score(" ".join(query_tokens), search_blob) <= 0:
+                continue
+            for fact in entity.get("facts", [])[:3]:
+                fact_text = str(fact).strip()
+                if fact_text:
+                    candidates.append(fact_text)
+            for relation in entity.get("relations", [])[:3]:
+                if not isinstance(relation, dict):
+                    continue
+                predicate = str(relation.get("predicate", "")).replace("_", " ").strip()
+                target = str(relation.get("target", "")).strip()
+                if predicate and target:
+                    candidates.append(f"{entity.get('name', 'Entity')} {predicate} {target}.")
+        return self._merge_unique(candidates)
+
+    def _record_text_modifiers(self, records: list[dict[str, Any]]) -> dict[str, float]:
+        modifiers: dict[str, float] = {}
+        for record in records:
+            text = str(record.get("text", "")).strip()
+            if not text:
+                continue
+            modifier = 0.0
+            modifier += max(0, int(record.get("confidence", 7)) - self.settings.memory_confidence_threshold) * 0.01
+            modifier += max(0, int(record.get("importance", 7)) - self.settings.memory_confidence_threshold) * 0.01
+            if record.get("demoted"):
+                modifier -= 0.08
+            modifiers[text] = max(modifiers.get(text, float("-inf")), modifier)
+        return modifiers
+
+    def _mark_records_retrieved(self, matched_texts: list[str], records: list[dict[str, Any]]) -> None:
+        text_set = {str(text).strip() for text in matched_texts if str(text).strip()}
+        if not text_set:
+            return
+        touched = False
+        for record in records:
+            text = str(record.get("text", "")).strip()
+            if text not in text_set:
+                continue
+            record["last_retrieved_at"] = self._now_iso()
+            record["retrieval_count"] = int(record.get("retrieval_count", 0)) + 1
+            if record.get("demoted"):
+                record["demoted"] = False
+            touched = True
+        if not touched:
+            return
+        payload = self._load_records_payload()
+        payload["records"] = records
+        payload["updated_at"] = self._now_iso()
+        self._save_records_payload(payload)
+
+    def _recent_session_files(self, limit_files: int = 4) -> list[Path]:
+        files = sorted(
+            self.sessions_dir.glob("session_*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        return files[:limit_files]
+
+    def _load_session_payload(self, session_path: Path) -> dict[str, Any]:
+        if not session_path.exists():
+            return {}
+        try:
+            payload = self._safe_json(session_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except OSError:
+            return {}
+        return {}
+
+    def _recent_session_candidates(self, max_turns: int = 24) -> list[str]:
+        candidates: list[str] = []
+        for session_file in self._recent_session_files():
+            payload = self._load_session_payload(session_file)
+            messages = payload.get("messages", [])
+            if not isinstance(messages, list):
+                continue
+
+            pending_user: dict[str, Any] | None = None
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role", "")).strip().lower()
+                content = str(message.get("content", "")).strip()
+                timestamp = str(message.get("timestamp", "")).strip()
+                if not content:
+                    continue
+                if role == "user":
+                    pending_user = {"content": content, "timestamp": timestamp}
+                    continue
+                if role == "assistant" and pending_user is not None:
+                    summary = (
+                        f"Recent chat on {timestamp or pending_user.get('timestamp', '')}: "
+                        f"User asked '{pending_user.get('content', '')}' and JARVIS answered '{content}'."
+                    ).strip()
+                    candidates.append(summary)
+                    pending_user = None
+        return candidates[-max_turns:]
+
+    def _recent_log_candidates(self, max_turns: int = 24) -> list[str]:
+        log_files = sorted(self.logs_dir.glob("*.jsonl"), reverse=True)
+        if not log_files:
+            return []
+
+        entries: list[dict[str, Any]] = []
+        for log_file in log_files:
+            try:
+                lines = log_file.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in reversed(lines):
+                if len(entries) >= max_turns * 2:
+                    break
+                payload = self._safe_json(line)
+                if isinstance(payload, dict):
+                    entries.append(payload)
+            if len(entries) >= max_turns * 2:
+                break
+
+        entries.reverse()
+        candidates: list[str] = []
+        pending_user: dict[str, Any] | None = None
+        for entry in entries:
+            role = str(entry.get("role", "")).strip().lower()
+            content = str(entry.get("content", "")).strip()
+            timestamp = str(entry.get("timestamp", "")).strip()
+            if not content:
+                continue
+            if role == "user":
+                pending_user = {"content": content, "timestamp": timestamp}
+                continue
+            if role == "assistant" and pending_user is not None:
+                if self._should_skip_recent_log_entry(content):
+                    pending_user = None
+                    continue
+                user_text = pending_user.get("content", "")
+                summary = (
+                    f"Recent chat on {timestamp or pending_user.get('timestamp', '')}: "
+                    f"User asked '{user_text}' and JARVIS answered '{content}'."
+                ).strip()
+                candidates.append(summary)
+                pending_user = None
+
+        return candidates[-max_turns:]
+
+    def _recent_log_messages(self, limit_messages: int = 12) -> list[dict[str, str]]:
+        log_files = sorted(self.logs_dir.glob("*.jsonl"), reverse=True)
+        if not log_files:
+            return []
+
+        entries: list[dict[str, Any]] = []
+        for log_file in log_files:
+            try:
+                lines = log_file.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in reversed(lines):
+                if len(entries) >= limit_messages:
+                    break
+                payload = self._safe_json(line)
+                if not isinstance(payload, dict):
+                    continue
+                role = str(payload.get("role", "")).strip().lower()
+                content = str(payload.get("content", "")).strip()
+                if role not in {"user", "assistant"} or not content:
+                    continue
+                if role == "assistant" and self._should_skip_recent_log_entry(content):
+                    continue
+                entries.append({"role": role, "content": content})
+            if len(entries) >= limit_messages:
+                break
+        entries.reverse()
+        return entries
+
+    def _should_skip_recent_log_entry(self, content: str) -> bool:
+        lowered = content.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "toolcall>",
+                "olcall>",
+                "live providers failed",
+                "running in offline mode",
+            )
+        )
+
+    def _is_recent_conversation_query(self, lowered_query: str) -> bool:
+        markers = (
+            "recently",
+            "recent chat",
+            "chat so far",
+            "what we have done",
+            "what have we done",
+            "what did we talk",
+            "what we talked",
+            "conversation so far",
+            "our chat",
+            "today's chat",
+            "today chat",
+            "recent conversation",
+            "so far",
+        )
+        return any(marker in lowered_query for marker in markers)
 
     def _rank_candidates(
         self,
         query_variants: list[str],
         candidates: list[str],
         vector_hits: set[str] | None = None,
+        score_modifiers: dict[str, float] | None = None,
     ) -> tuple[list[str], float]:
         vector_hits = vector_hits or set()
+        score_modifiers = score_modifiers or {}
         scored: list[tuple[float, str]] = []
         for candidate in candidates:
             best_score = max((self._token_overlap_score(variant, candidate) for variant in query_variants), default=0.0)
             if candidate in vector_hits:
                 best_score += 0.03
+            best_score += score_modifiers.get(candidate, 0.0)
             if best_score > 0:
                 scored.append((best_score, candidate))
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -458,7 +1505,7 @@ class Memory:
             "can", "could", "did", "do", "does", "for", "from", "hey", "hi", "how",
             "i", "in", "is", "it", "kind", "know", "man", "me", "my", "of",
             "on", "or", "please", "pls", "tell", "the", "to", "what", "whats",
-            "which", "who", "you", "your", "also",
+            "which", "who", "you", "your", "also", "we", "have", "nah", "so", "far",
         }
 
     def _normalize_token(self, token: str) -> str:
@@ -531,18 +1578,26 @@ class Memory:
             return None
 
     def _collect_memory_items_from_disk(self) -> list[dict[str, str]]:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
         items: list[dict[str, str]] = []
-        items.extend(
-            {"tag": "PERSONAL", "text": line, "source": str(self.profile_path)}
-            for line in self._summary_candidates_from_file(self.profile_path)
-        )
-        items.extend(
-            {"tag": "PROJECT", "text": line, "source": str(self.projects_path)}
-            for line in self._summary_candidates_from_file(self.projects_path)
-        )
-
-        for chunk_file in sorted(self.chunks_dir.glob("*.txt")):
-            items.extend(self._chunk_items_from_file(chunk_file))
+        for record in records:
+            if not record.get("active", True):
+                continue
+            if int(record.get("confidence", 0)) < self.settings.memory_confidence_threshold:
+                continue
+            if record.get("demoted"):
+                continue
+            items.append(
+                {
+                    "tag": self._sanitize_tag(record.get("tag")),
+                    "text": str(record.get("text", "")).strip(),
+                    "source": str(record.get("source_ref", "")).strip() or "records",
+                    "id": str(record.get("id", "")).strip(),
+                }
+            )
 
         deduped: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
@@ -562,10 +1617,11 @@ class Memory:
                 continue
             match = re.match(r"^\[(PERSONAL|PROJECT|FACT)\]\s+(.*)$", cleaned)
             if match:
+                text = re.sub(r"\s+\|\s+confidence=\d+\s+importance=\d+\s*$", "", match.group(2).strip())
                 items.append(
                     {
                         "tag": match.group(1),
-                        "text": match.group(2).strip(),
+                        "text": text,
                         "source": str(path),
                     }
                 )
@@ -573,7 +1629,13 @@ class Memory:
 
     def _memory_source_state(self) -> dict[str, Any]:
         files: list[dict[str, Any]] = []
-        for path in [self.profile_path, self.projects_path, *sorted(self.chunks_dir.glob("*.txt"))]:
+        for path in [
+            self.records_path,
+            self.entities_path,
+            self.profile_path,
+            self.projects_path,
+            *sorted(self.chunks_dir.glob("*.txt")),
+        ]:
             if not path.exists():
                 continue
             stat = path.stat()

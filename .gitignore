@@ -19,6 +19,7 @@ Thumbs.db
 # Local reference or scratch folders
 .sixth/
 ankita-ref/
+ankita-god-tier-ref/
 
 # Secrets and local config
 jarvis/config/.env
@@ -48,6 +49,8 @@ jarvis/data_user/email_to_school.txt
 # Memory logs / vector storage
 jarvis/memory/logs/*
 !jarvis/memory/logs/.gitkeep
+jarvis/memory/sessions/*
+!jarvis/memory/sessions/.gitkeep
 jarvis/memory/vector_db/*
 !jarvis/memory/vector_db/.gitkeep
 

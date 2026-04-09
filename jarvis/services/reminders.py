@@ -8,6 +8,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from config.settings import SETTINGS, USER_REMINDERS_FILE, Settings
 
@@ -75,14 +76,18 @@ class ReminderService:
             reminders = self._read_reminders_unlocked()
             reminders.append(reminder)
             self._write_reminders_unlocked(reminders)
-        return reminder
+        return self._decorate_reminder(reminder)
 
     def list_reminders(self, include_completed: bool = False) -> list[dict[str, Any]]:
         with self._lock:
             reminders = self._read_reminders_unlocked()
         if include_completed:
-            return reminders
-        return [reminder for reminder in reminders if reminder.get("status") == "pending"]
+            return [self._decorate_reminder(reminder) for reminder in reminders]
+        return [
+            self._decorate_reminder(reminder)
+            for reminder in reminders
+            if reminder.get("status") == "pending"
+        ]
 
     def delete_reminder(self, reminder_id: str) -> dict[str, Any]:
         reminder_id = str(reminder_id).strip()
@@ -107,7 +112,7 @@ class ReminderService:
                 continue
             due_at = self._parse_due_at(reminder.get("due_at", ""))
             if due_at <= now:
-                due.append(reminder)
+                due.append(self._decorate_reminder(reminder))
         return due
 
     def mark_delivered(self, reminder_ids: list[str]) -> None:
@@ -160,6 +165,24 @@ class ReminderService:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC)
+
+    def _decorate_reminder(self, reminder: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(reminder)
+        for key in ("due_at", "created_at", "delivered_at"):
+            value = reminder.get(key)
+            if not value:
+                continue
+            try:
+                enriched[f"{key}_local"] = self.format_timestamp(value)
+            except Exception:
+                continue
+        return enriched
+
+    def format_timestamp(self, value: str | datetime) -> str:
+        parsed = self._parse_due_at(value)
+        local_zone = ZoneInfo(self.settings.reminder_timezone)
+        local_time = parsed.astimezone(local_zone)
+        return local_time.strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
 def get_reminder_service(settings: Settings | None = None) -> ReminderService:

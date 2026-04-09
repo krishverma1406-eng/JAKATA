@@ -149,10 +149,10 @@ class WakeWordDetector:
 
     def _has_tflite_runtime(self) -> bool:
         try:
-            import tflite_runtime.interpreter  # type: ignore # pragma: no cover
+            import importlib.util
         except ImportError:
             return False
-        return True
+        return importlib.util.find_spec("tflite_runtime.interpreter") is not None
 
     def _input_device(self, sounddevice_module: Any) -> int | str:
         raw = self.settings.wake_word_input_device.strip()

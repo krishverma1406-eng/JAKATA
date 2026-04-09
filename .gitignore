@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local reference or scratch folders
+.sixth/
+ankita-ref/
+
+# Secrets and local config
+jarvis/config/.env
+jarvis/config/*.json
+!jarvis/config/.env.example
+!jarvis/config/google/.gitkeep
+jarvis/config/google/*.json
+
+# Runtime auth caches
+jarvis/config/github_*token*.json
+jarvis/config/google/*token*.json
+
+# User data and local memory
+jarvis/data_user/*
+!jarvis/data_user/.gitkeep
+!jarvis/data_user/notes/
+jarvis/data_user/notes/*
+!jarvis/data_user/notes/.gitkeep
+jarvis/data_user/chunks/*
+jarvis/data_user/screenshots/*
+jarvis/data_user/vector_index/*
+jarvis/data_user/reminders.json
+jarvis/data_user/profile.md
+jarvis/data_user/projects.md
+jarvis/data_user/email_to_school.txt
+
+# Memory logs / vector storage
+jarvis/memory/logs/*
+!jarvis/memory/logs/.gitkeep
+jarvis/memory/vector_db/*
+!jarvis/memory/vector_db/.gitkeep
+
+# Runtime AI state
+jarvis/data_ai/provider_state.json
+jarvis/data_ai/self_update_log.md
+
+# Optional local model file
+hey_jarvis_v0.1.tflite

@@ -214,6 +214,29 @@ class Brain:
         url = f"{self.settings.nvidia_base_url.rstrip('/')}/chat/completions"
         if stream_handler is not None:
             streamed = self._post_json_stream_requests(url, payload, headers, self.settings.nvidia_timeout_seconds, stream_handler)
+            if not streamed.get("content") and not streamed.get("tool_calls"):
+                raw = self._post_json_requests(url, payload, headers, self.settings.nvidia_timeout_seconds)
+                message = raw["choices"][0]["message"]
+                tool_calls = [
+                    {
+                        "id": call.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        "name": call["function"]["name"],
+                        "arguments": self._safe_json(call["function"].get("arguments", "{}")),
+                    }
+                    for call in message.get("tool_calls", [])
+                ]
+                content = self._stringify_content(message.get("content", ""))
+                embedded_tool_calls, cleaned_content = self._extract_embedded_tool_calls(content)
+                if embedded_tool_calls:
+                    tool_calls.extend(embedded_tool_calls)
+                    content = cleaned_content
+                return {
+                    "provider": "nvidia",
+                    "model": raw.get("model", payload["model"]),
+                    "content": content,
+                    "tool_calls": tool_calls,
+                    "raw": raw,
+                }
             return {
                 "provider": "nvidia",
                 "model": streamed.get("model") or payload["model"],
@@ -299,6 +322,29 @@ class Brain:
     ) -> dict[str, Any]:
         if stream_handler is not None:
             streamed = self._post_json_stream_requests(url, payload, headers, timeout, stream_handler)
+            if not streamed.get("content") and not streamed.get("tool_calls"):
+                raw = self._post_json_requests(url, payload, headers, timeout)
+                message = raw["choices"][0]["message"]
+                tool_calls = [
+                    {
+                        "id": call.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        "name": call["function"]["name"],
+                        "arguments": self._safe_json(call["function"].get("arguments", "{}")),
+                    }
+                    for call in message.get("tool_calls", [])
+                ]
+                content = self._stringify_content(message.get("content", ""))
+                embedded_tool_calls, cleaned_content = self._extract_embedded_tool_calls(content)
+                if embedded_tool_calls:
+                    tool_calls.extend(embedded_tool_calls)
+                    content = cleaned_content
+                return {
+                    "provider": provider,
+                    "model": raw.get("model", payload["model"]),
+                    "content": content,
+                    "tool_calls": tool_calls,
+                    "raw": raw,
+                }
             return {
                 "provider": provider,
                 "model": streamed.get("model") or payload["model"],

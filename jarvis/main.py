@@ -23,21 +23,6 @@ from services.reminders import get_reminder_service
 CONSOLE = Console(highlight=False, soft_wrap=True)
 
 
-def _speak_in_background(agent: Agent, response: str) -> None:
-    if not agent.settings.tts_enabled or not response:
-        return
-
-    def _worker() -> None:
-        try:
-            from services.tts import speak_sync
-
-            speak_sync(response, agent.settings)
-        except Exception:
-            pass
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
 class CliRenderer:
     """Rich terminal rendering for JARVIS."""
 
@@ -142,7 +127,6 @@ def _notify_reminder(
     else:
         with print_lock:
             _print()
-    _speak_in_background(agent, text)
 
 
 def _initialize_reminders(
@@ -191,9 +175,8 @@ def main() -> None:
 
     session_settings = replace(
         SETTINGS,
-        tts_enabled=SETTINGS.tts_enabled or args.voice or args.wake,
-        stt_enabled=SETTINGS.stt_enabled or args.voice or args.wake,
-        wake_word_enabled=SETTINGS.wake_word_enabled or args.wake,
+        stt_enabled=bool(args.voice or args.wake),
+        wake_word_enabled=bool(args.wake),
     )
     agent = Agent(settings=session_settings)
     if args.mode.strip():
@@ -294,9 +277,12 @@ def _run_combined_mode(agent: Agent, renderer: CliRenderer) -> None:
         try:
             user_input = renderer.input().strip()
         except (EOFError, KeyboardInterrupt):
-            renderer.info("\nJARVIS: Shutting down.")
-            stop_event.set()
-            break
+            # Only exit if user actually pressed Ctrl+C, not from background thread noise
+            if stop_event.is_set():
+                renderer.info("\nJARVIS: Shutting down.")
+                break
+            # Spurious interrupt from background thread - ignore and continue
+            continue
 
         if user_input.lower() in {"exit", "quit"}:
             renderer.line("[green]JARVIS: Goodbye.[/green]")
@@ -321,15 +307,14 @@ def _run_combined_mode(agent: Agent, renderer: CliRenderer) -> None:
                 process_lock.release()
             continue
 
-        if not process_lock.acquire(blocking=False):
+        if not process_lock.acquire(blocking=True):
             continue
         try:
-            _run_agent_stream(agent, user_input, renderer=renderer, print_lock=print_lock)
+            _run_agent_stream(agent, user_input, renderer=renderer, print_lock=None)
+        except Exception as exc:
+            renderer.error(f"Error: {exc}")
         finally:
             process_lock.release()
-
-    if wake_thread is not None and wake_thread.is_alive():
-        stop_event.set()
 
 
 def _handle_cli_command(agent: Agent, command: str, renderer: CliRenderer) -> str | None:
@@ -394,7 +379,6 @@ def _run_agent_stream(
     renderer: CliRenderer,
     print_lock: threading.Lock | None = None,
 ) -> None:
-    stream_state = {"printed": False}
     mode_config = agent.interface.get_mode(agent.mode)
 
     def _safe(fn: callable) -> None:
@@ -403,11 +387,6 @@ def _run_agent_stream(
             return
         with print_lock:
             fn()
-
-    def _stream_to_stdout(chunk: str) -> None:
-        if chunk:
-            stream_state["printed"] = True
-        _safe(lambda: renderer.assistant_chunk(chunk))
 
     def _event_handler(event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -443,11 +422,18 @@ def _run_agent_stream(
                 style = "bold yellow"
             _safe(lambda: renderer.console.print(Text(message, style=style)))
 
+    try:
+        response = agent.run(prompt, event_handler=_event_handler)
+    except Exception as exc:
+        _safe(lambda: renderer.error(f"Agent error: {exc}"))
+        import traceback
+        _safe(lambda: renderer.console.print(traceback.format_exc(), style="dim red"))
+        return
+    final_text = response or "No response generated."
+    _safe(lambda: renderer.console.print())
     _safe(renderer.assistant_prefix)
-    response = agent.run(prompt, stream_handler=_stream_to_stdout, event_handler=_event_handler)
-    if not stream_state["printed"] and response:
-        _safe(lambda: renderer.assistant_chunk(response))
-    if not response.endswith("\n"):
+    _safe(lambda: renderer.assistant_chunk(final_text))
+    if not final_text.endswith("\n"):
         _safe(lambda: renderer.console.print())
 
     turn_meta = agent.last_turn_meta
@@ -464,7 +450,6 @@ def _run_agent_stream(
             debug_bits.append(f"{latency_ms} ms")
         if debug_bits:
             _safe(lambda: renderer.console.print(Text(" | ".join(debug_bits), style="dim")))
-    _speak_in_background(agent, response)
 
 
 if __name__ == "__main__":

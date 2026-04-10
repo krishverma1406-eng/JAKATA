@@ -367,7 +367,7 @@ def _build_stream(request: ChatRequest) -> Any:
                     emit({"done": True, "session_id": session_id, "session": _session_payload(agent)})
                     return
 
-                response_text = agent.run(message, stream_handler=stream_handler, event_handler=event_handler)
+                response_text = agent.run(message, event_handler=event_handler)
                 if not streamed_any and response_text:
                     if not route_emitted:
                         emit({"activity": {"event": "routing", "route": current_route}})

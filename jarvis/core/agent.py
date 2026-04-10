@@ -15,6 +15,87 @@ from core.planner import Planner
 from core.tool_registry import ToolRegistry
 
 
+# Fallback hints for tool failures
+_FALLBACK_HINTS: dict[str, str] = {
+    "web_search": (
+        "Web search failed. Report which provider failed if the error names Tavily or Brave, "
+        "suggest retrying later, and do not claim that live web results were retrieved."
+    ),
+    "browser_control": (
+        "Nova Act browser failed. If the user needs web content, "
+        "try web_search instead. If they need to open an app, try app_launcher_tool."
+    ),
+    "gmail_tool": (
+        "Gmail tool failed. Do NOT retry with gmail_tool. Tell the user what failed "
+        "and that they may need to run OAuth setup if not already configured."
+    ),
+    "calendar_tool": (
+        "Calendar tool failed. Do NOT retry with calendar_tool. Tell the user what failed "
+        "and that they may need to run OAuth setup if not already configured."
+    ),
+    "music_player": (
+        "VLC music player failed. If the user wants YouTube playback, "
+        "use browser_control to open the YouTube URL instead."
+    ),
+    "screenshot_tool": (
+        "Screenshot tool failed. Try os_control with action=screenshot as fallback."
+    ),
+    "weather_tool": (
+        "OpenWeatherMap failed. Try web_search with query "
+        "'current weather [location]' as fallback."
+    ),
+    "reminder_tool": (
+        "Reminder storage failed. Create a note with notes_tool as a fallback "
+        "and tell the user it's stored as a note, not a timed reminder."
+    ),
+    "app_launcher_tool": (
+        "App launcher failed. Try terminal_tool with action=start_process "
+        "or action=run with Start-Process command as fallback."
+    ),
+    "file_manager": (
+        "File manager failed. Try terminal_tool with Get-Content or "
+        "Get-ChildItem as fallback for read/list operations."
+    ),
+    "os_control": (
+        "Desktop control failed. Report the exact desktop automation error. "
+        "If pyautogui or a desktop dependency is missing, stop and tell the user that setup is required."
+    ),
+    "terminal_tool": (
+        "Terminal fallback failed. Report the exact exit code and stderr. "
+        "Do not pretend the command worked."
+    ),
+    "calculator_tool": (
+        "Calculator tool failed. If the math is simple and safe to do directly, "
+        "compute it inline and say that the answer was not tool-verified."
+    ),
+}
+
+
+def _get_fallback_hint(tool_name: str, error: str) -> str:
+    """Get fallback hint for a failed tool based on error type."""
+    # Auth/config errors — never retry, never fallback
+    error_lower = error.lower()
+    auth_signals = (
+        "api key",
+        "oauth",
+        "not configured",
+        "client_secret",
+        "client secret",
+        "token",
+        "credential",
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+    )
+    if any(signal in error_lower for signal in auth_signals):
+        return (
+            f"{tool_name} requires configuration that is not set up. "
+            "Tell the user exactly what's missing. Do not attempt any fallback."
+        )
+    return _FALLBACK_HINTS.get(tool_name, "")
+
+
 class Agent:
     """Plan, act, observe, and respond."""
 
@@ -148,7 +229,8 @@ class Agent:
         last_response_meta: dict[str, Any] = {}
 
         for _ in range(self.settings.agent_max_iterations):
-            active_stream_handler = stream_handler if (not tool_definitions or tool_trace) else None
+            # Always stream — the model won't stream tool-call turns anyway
+            active_stream_handler = stream_handler
             brain_started_at = time.perf_counter()
             response = self.brain.chat(
                 messages=messages,
@@ -244,12 +326,28 @@ class Agent:
                     tool_name=tool_call["name"],
                     step_index=plan_step_index,
                 )
+                
+                # Inject fallback hint if tool failed
+                tool_content = json.dumps(result, ensure_ascii=True, default=str)
+                if isinstance(result, dict) and result.get("ok") is False:
+                    error_msg = str(result.get("error", "unknown error")).strip()
+                    fallback_note = _get_fallback_hint(tool_call["name"], error_msg)
+                    if fallback_note:
+                        tool_content = json.dumps(
+                            {
+                                **result,
+                                "_fallback_instruction": fallback_note,
+                            },
+                            ensure_ascii=True,
+                            default=str,
+                        )
+                
                 messages.append(
                     {
                         "role": "tool",
                         "name": tool_call["name"],
                         "tool_call_id": tool_call.get("id"),
-                        "content": json.dumps(result, ensure_ascii=True, default=str),
+                        "content": tool_content,
                     }
                 )
 
@@ -279,6 +377,17 @@ class Agent:
         mode_config: dict[str, Any],
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
+        
+        # Add session awareness — always show turn count, even on first turn
+        turn_count = len([m for m in self.history if m.get("role") == "user"])
+        session_name = self.session_meta.get("display_name", "Untitled")
+        messages.append(
+            {
+                "role": "system",
+                "content": f"This is turn {turn_count + 1} of the current session '{session_name}'.",
+            }
+        )
+        
         daily_summary = self.memory.get_daily_context_summary(self.brain)
 
         mode_prompt = str(mode_config.get("system_prompt", "")).strip()

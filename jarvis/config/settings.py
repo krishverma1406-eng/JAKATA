@@ -200,8 +200,8 @@ SETTINGS = Settings(
         True,
     ),
     tts_enabled=_parse_bool(
-        _getenv("TTS_ENABLED", "true"),
-        True,
+        _getenv("TTS_ENABLED", "false"),
+        False,
     ),
     tts_voice=_getenv("TTS_VOICE", "en-US-GuyNeural") or "en-US-GuyNeural",
     tts_rate=_getenv("TTS_RATE", "+0%") or "+0%",

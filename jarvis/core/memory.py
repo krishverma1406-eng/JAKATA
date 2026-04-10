@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import hashlib
 import io
 import importlib
 import json
@@ -69,9 +70,10 @@ class Memory:
         self._daily_summary_cache: tuple[str, str] | None = None
         self._semantic_candidate_cache_key: tuple[str, ...] | None = None
         self._semantic_candidate_cache_embeddings: list[list[float]] | None = None
+        self._query_embedding_cache: dict[tuple[str, ...], list[list[float]]] = {}
         self.session_store = SessionStore(self.sessions_dir)
         self._bootstrap_memory_store()
-        self.ensure_index_current()
+        threading.Thread(target=self._safe_ensure_index, daemon=True).start()
 
     def remember(
         self,
@@ -187,6 +189,8 @@ class Memory:
                 continue
             if not record.get("active", True):
                 continue
+            if record.get("demoted"):
+                continue
             text = str(record.get("text", "")).strip()
             normalized = text.lower()
             if not text or normalized in seen:
@@ -230,11 +234,16 @@ class Memory:
         limit = limit or self.settings.memory_top_k
         lowered = query.lower()
         query_variants = self._query_variants(query)
+        semantic_ready = self._semantic_retrieval_ready()
         record_payload = self._load_records_payload()
         records = record_payload.get("records", [])
         if not isinstance(records, list):
             records = []
-        active_records = [record for record in records if record.get("active", True)]
+        active_records = [
+            record
+            for record in records
+            if record.get("active", True) and not record.get("demoted")
+        ]
         entity_candidates = self._entity_candidates(query)
         session_candidates = self._session_candidates(query, limit * 2)
         record_modifiers = self._record_text_modifiers(active_records)
@@ -244,25 +253,32 @@ class Memory:
         )
         recent_query = self._is_recent_conversation_query(lowered)
         if recent_query and recent_candidates:
-            recent_ranked, recent_best = self._rank_candidates(query_variants, recent_candidates)
+            recent_ranked, recent_best = self._rank_candidates(
+                query_variants,
+                recent_candidates,
+                allow_semantic=semantic_ready,
+            )
             if recent_ranked and recent_best >= 0.05:
                 if len(recent_ranked) >= limit:
                     return recent_ranked[:limit]
                 supplemental_ranked, _ = self._rank_candidates(
                     query_variants,
                     self._merge_unique(
-                        self._candidate_pool(include_chunks=True),
+                        self._candidate_pool(include_facts=True),
                         entity_candidates,
                         session_candidates,
                     ),
                     score_modifiers=record_modifiers,
+                    allow_semantic=semantic_ready,
                 )
                 return self._merge_unique(recent_ranked, supplemental_ranked)[:limit]
 
         if any(marker in lowered for marker in ("know about me", "remember about me", "who am i", "my profile")):
-            profile_items = self._merge_unique(self._candidate_pool(include_chunks=False), entity_candidates, session_candidates)
-            vector_hit_records = self._merge_unique_records(
-                *[self._query_vector_store(variant, limit * 2) for variant in query_variants]
+            profile_items = self._merge_unique(self._candidate_pool(include_facts=False), entity_candidates, session_candidates)
+            vector_hit_records = (
+                self._merge_unique_records(*[self._query_vector_store(variant, limit * 2) for variant in query_variants])
+                if semantic_ready
+                else []
             )
             vector_hits = [item["text"] for item in vector_hit_records]
             ranked, _ = self._rank_candidates(
@@ -270,27 +286,31 @@ class Memory:
                 self._merge_unique(profile_items, vector_hits),
                 vector_hits=set(vector_hits),
                 score_modifiers=record_modifiers,
+                allow_semantic=semantic_ready,
             )
             self._mark_records_retrieved(ranked[:limit], records)
             return ranked[:limit]
 
-        summary_candidates = self._merge_unique(self._candidate_pool(include_chunks=False), entity_candidates, session_candidates)
+        summary_candidates = self._merge_unique(self._candidate_pool(include_facts=False), entity_candidates, session_candidates)
         if recent_query:
             summary_candidates = self._merge_unique(recent_candidates, summary_candidates)
         summary_ranked, summary_best = self._rank_candidates(
             query_variants,
             summary_candidates,
             score_modifiers=record_modifiers,
+            allow_semantic=semantic_ready,
         )
         if summary_ranked and summary_best >= 0.18:
             self._mark_records_retrieved(summary_ranked[:limit], records)
             return summary_ranked[:limit]
 
-        full_candidates = self._merge_unique(self._candidate_pool(include_chunks=True), entity_candidates, session_candidates)
+        full_candidates = self._merge_unique(self._candidate_pool(include_facts=True), entity_candidates, session_candidates)
         if recent_candidates:
             full_candidates = self._merge_unique(recent_candidates, full_candidates)
-        vector_hit_records = self._merge_unique_records(
-            *[self._query_vector_store(variant, limit * 2) for variant in query_variants]
+        vector_hit_records = (
+            self._merge_unique_records(*[self._query_vector_store(variant, limit * 2) for variant in query_variants])
+            if semantic_ready
+            else []
         )
         vector_hits = [item["text"] for item in vector_hit_records]
         ranked, best_score = self._rank_candidates(
@@ -298,12 +318,13 @@ class Memory:
             self._merge_unique(full_candidates, vector_hits),
             vector_hits=set(vector_hits),
             score_modifiers=record_modifiers,
+            allow_semantic=semantic_ready,
         )
         if ranked and (best_score >= 0.08 or vector_hits):
             self._mark_records_retrieved(ranked[:limit], records)
             return ranked[:limit]
 
-        fallback_hits, _ = self._fast_recall(query_variants[0], limit, include_chunks=True)
+        fallback_hits, _ = self._fast_recall(query_variants[0], limit, include_facts=True)
         self._mark_records_retrieved(fallback_hits, records)
         return fallback_hits
 
@@ -353,13 +374,11 @@ class Memory:
         if not stored_records:
             return {"stored": 0, "chunks": []}
 
-        chunk_lines = [
-            f"[{record['tag']}] {record['text']} | confidence={record['confidence']} importance={record['importance']}"
-            for record in stored_records
-        ]
-        chunk_path = self._append_chunk(chunk_lines)
+        # Do NOT write chunk files — records are the source of truth.
+        # Chunk files are legacy write-logs that cause stale data in recall and
+        # trigger unnecessary re-indexing via _memory_source_state.
         self._rebuild_materialized_memory(stored_records_changed=True)
-        return {"stored": len(stored_records), "chunks": [str(chunk_path)]}
+        return {"stored": len(stored_records), "chunks": []}
 
     def load_recent_messages(self, limit_messages: int = 12) -> list[dict[str, str]]:
         collected: list[dict[str, str]] = []
@@ -393,31 +412,67 @@ class Memory:
         if current_state == self._read_index_state():
             return
         items = self._collect_memory_items_from_disk()
-        if not items:
-            self._write_index_state(current_state)
-            return
         collection = self._get_collection()
         embedder = self._get_embedder()
         if collection is None or embedder is None:
+            self._write_index_state(current_state)
             return
-        self._reset_collection(collection)
-        documents = [item["text"] for item in items]
-        embeddings = embedder.encode(documents).tolist()
-        collection.add(
-            ids=[str(item.get("id", "")).strip() or f"memory_{uuid.uuid4().hex}" for item in items],
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=[
-                {
-                    "tag": item["tag"],
-                    "created_at": datetime.now().isoformat(),
-                    "source": item.get("source", "disk"),
-                    "record_id": str(item.get("id", "")).strip(),
-                }
-                for item in items
-            ],
-        )
+
+        try:
+            existing = collection.get(include=[])
+            existing_ids = {
+                str(item_id).strip()
+                for item_id in (existing.get("ids", []) or [])
+                if str(item_id).strip()
+            }
+        except Exception:
+            existing_ids = set()
+
+        item_map = {
+            str(item.get("id", "")).strip(): item
+            for item in items
+            if str(item.get("id", "")).strip()
+        }
+        item_ids = set(item_map)
+
+        stale_ids = sorted(existing_ids - item_ids)
+        if stale_ids:
+            with contextlib.suppress(Exception):
+                collection.delete(ids=stale_ids)
+
+        new_items = [item_map[item_id] for item_id in sorted(item_ids - existing_ids)]
+        if new_items:
+            try:
+                documents = [item["text"] for item in new_items]
+                embeddings = embedder.encode(documents).tolist()
+                collection.add(
+                    ids=[item["id"] for item in new_items],
+                    documents=documents,
+                    embeddings=embeddings,
+                    metadatas=[
+                        {
+                            "tag": item["tag"],
+                            "created_at": datetime.now().isoformat(),
+                            "source": item.get("source", "records"),
+                            "record_id": item["id"],
+                        }
+                        for item in new_items
+                    ],
+                )
+            except Exception:
+                # Write state anyway so we don't retry on every call and block forever.
+                # The next records change will unlink index_state and trigger a fresh attempt.
+                self._write_index_state(current_state)
+                return
+
         self._write_index_state(current_state)
+
+    def _safe_ensure_index(self) -> None:
+        """Safely run ensure_index_current with exception handling for background threads."""
+        try:
+            self.ensure_index_current()
+        except Exception:
+            pass
 
     def _log_message(
         self,
@@ -513,12 +568,23 @@ class Memory:
 
     def _fallback_extract(self, transcript: list[str]) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
+        existing_texts = {
+            str(record.get("text", "")).strip().lower()
+            for record in records
+            if record.get("active", True) and not record.get("demoted")
+        }
         for line in transcript:
             lowered = line.lower()
-            if not lowered.startswith("USER:"):
+            if not lowered.startswith("user:"):
                 continue
-            content = line[6:].strip()
+            content = line[5:].strip()
             if not self._looks_like_durable_user_fact(content):
+                continue
+            if content.lower() in existing_texts:
                 continue
             if any(marker in lowered for marker in ("i am ", "my ", "i like ", "i prefer ", "i want ", "remember ")):
                 items.append(
@@ -612,9 +678,34 @@ class Memory:
         tag = str(value or "FACT").strip().upper()
         return tag if tag in {"PERSONAL", "PROJECT", "FACT"} else "FACT"
 
+    def _memory_topic_key(self, tag: str, text: str) -> str | None:
+        lowered = str(text).strip().lower()
+        if not lowered:
+            return None
+
+        if tag == "PERSONAL":
+            if "@" in lowered or "email" in lowered:
+                return "email"
+            if "github username" in lowered or "github" in lowered:
+                return "github"
+            if any(marker in lowered for marker in ("school", "studies at", "study at", "studying in")):
+                return "school"
+            if any(marker in lowered for marker in ("my name", "name is ", "user's name", "the user name")):
+                return "name"
+            if any(marker in lowered for marker in ("live in", "lives in", "living in", "originally from", "from hisar", "from delhi")):
+                return "location"
+            if any(marker in lowered for marker in ("class ", "grade ", "11th", "12th", "10th")):
+                return "class_grade"
+        return None
+
     def _default_memory_key(self, tag: str, text: str) -> str:
-        normalized = " ".join(self._normalized_tokens(text)) or re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-        key_basis = "-".join(normalized.split()[:6]) or uuid.uuid4().hex[:12]
+        topic_key = self._memory_topic_key(tag, text)
+        if topic_key:
+            key_basis = topic_key
+        else:
+            normalized_tokens = sorted(self._normalized_tokens(text))
+            normalized = " ".join(normalized_tokens) or re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+            key_basis = "-".join(normalized.split()[:6]) or uuid.uuid4().hex[:12]
         return f"{tag.lower()}.{key_basis}"
 
     def _normalize_memory_item(self, raw_item: Any) -> dict[str, Any] | None:
@@ -810,9 +901,16 @@ class Memory:
                 continue
 
             new_id = f"memory_{uuid.uuid4().hex}"
+            conflicting = self._find_conflicting_record(normalized["text"], normalized["tag"], records)
+            if conflicting is not None:
+                conflicting["active"] = False
+                conflicting["demoted"] = True
+                conflicting["superseded_by"] = new_id
+                conflicting["updated_at"] = self._now_iso()
             for record in records:
                 if (
                     record.get("active", True)
+                    and not record.get("demoted")
                     and str(record.get("memory_key", "")).strip()
                     and str(record.get("memory_key", "")).strip() == normalized["memory_key"]
                     and str(record.get("text", "")).strip() != normalized["text"]
@@ -844,20 +942,53 @@ class Memory:
         self._save_records_payload(payload)
         return accepted_records
 
+    def _find_conflicting_record(
+        self,
+        new_text: str,
+        tag: str,
+        records: list[dict[str, Any]],
+        overlap_threshold: float = 0.55,
+    ) -> dict[str, Any] | None:
+        new_tokens = self._normalized_tokens(new_text)
+        new_topic = self._memory_topic_key(tag, new_text)
+        if len(new_tokens) < 2 and not new_topic:
+            return None
+
+        best_score = 0.0
+        best_record: dict[str, Any] | None = None
+        for record in records:
+            if not record.get("active", True) or record.get("demoted"):
+                continue
+            if self._sanitize_tag(record.get("tag")) != tag:
+                continue
+            existing_text = str(record.get("text", "")).strip()
+            if not existing_text or existing_text == new_text:
+                continue
+            existing_topic = self._memory_topic_key(tag, existing_text)
+            if new_topic and existing_topic and new_topic == existing_topic:
+                return record
+            existing_tokens = self._normalized_tokens(existing_text)
+            if not existing_tokens:
+                continue
+            intersection = len(new_tokens & existing_tokens)
+            union = len(new_tokens | existing_tokens)
+            overlap = (intersection / union) if union else 0.0
+            if overlap > overlap_threshold and overlap > best_score:
+                best_score = overlap
+                best_record = record
+        return best_record
+
     def _sanitize_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for record in records:
-            source_type = str(record.get("source_type", "")).strip().lower()
-            source_ref = str(record.get("source_ref", "")).strip()
             tag = self._sanitize_tag(record.get("tag"))
             text = str(record.get("text", "")).strip()
-            if record.get("explicit") and source_ref not in {str(self.profile_path), str(self.projects_path)}:
+            if not text:
+                record["active"] = False
+                record["demoted"] = True
                 continue
-            if (
-                source_type in {"conversation_extract", "legacy_chunk"}
-                or source_ref in {str(self.profile_path), str(self.projects_path)}
-                or tag == "FACT"
-                or not self._is_safe_auto_memory(text, tag)
-            ):
+            if record.get("explicit"):
+                continue
+            if not self._is_safe_auto_memory(text, tag):
                 record["active"] = False
                 record["demoted"] = True
         return records
@@ -891,26 +1022,30 @@ class Memory:
         self._save_records_payload(payload)
         self._rebuild_entities(records)
         self._rewrite_summary_docs_from_records(records)
+        self._semantic_candidate_cache_key = None
+        self._semantic_candidate_cache_embeddings = None
+        self._query_embedding_cache = {}
         if stored_records_changed:
             with contextlib.suppress(OSError):
                 self.index_state_path.unlink()
-        self.ensure_index_current()
+            threading.Thread(target=self._safe_ensure_index, daemon=True).start()
 
     def _rewrite_summary_docs_from_records(self, records: list[dict[str, Any]]) -> None:
         personal_lines = [
             str(record.get("text", "")).strip()
             for record in records
-            if record.get("active", True) and self._sanitize_tag(record.get("tag")) == "PERSONAL"
+            if record.get("active", True)
+            and not record.get("demoted")
+            and self._sanitize_tag(record.get("tag")) == "PERSONAL"
         ]
         project_lines = [
             str(record.get("text", "")).strip()
             for record in records
-            if record.get("active", True) and self._sanitize_tag(record.get("tag")) == "PROJECT"
+            if record.get("active", True)
+            and not record.get("demoted")
+            and self._sanitize_tag(record.get("tag")) == "PROJECT"
         ]
-        if not personal_lines:
-            personal_lines = self._trusted_chunk_candidates("PERSONAL")
-        if not project_lines:
-            project_lines = self._trusted_chunk_candidates("PROJECT")
+        # Remove fallback to chunks - records are the only source of truth
         self._rewrite_summary_file(self.profile_path, "## User Profile", personal_lines)
         self._rewrite_summary_file(self.projects_path, "## Active Projects", project_lines)
 
@@ -924,6 +1059,8 @@ class Memory:
         entities: dict[str, dict[str, Any]] = {}
         for record in records:
             if not record.get("active", True):
+                continue
+            if record.get("demoted"):
                 continue
             record_id = str(record.get("id", ""))
             facts = [str(record.get("text", "")).strip()]
@@ -991,8 +1128,25 @@ class Memory:
         profile_lines = self._summary_candidates_from_file(self.profile_path)
         project_lines = self._summary_candidates_from_file(self.projects_path)
         if not profile_lines and not project_lines:
-            profile_lines = self._trusted_chunk_candidates("PERSONAL")
-            project_lines = self._trusted_chunk_candidates("PROJECT")
+            # profile.md/projects.md are derived from records — if they're empty,
+            # read directly from records rather than falling back to stale chunk files.
+            payload = self._load_records_payload()
+            records = payload.get("records", [])
+            if isinstance(records, list):
+                profile_lines = [
+                    str(r.get("text", "")).strip()
+                    for r in records
+                    if r.get("active", True) and not r.get("demoted")
+                    and self._sanitize_tag(r.get("tag")) == "PERSONAL"
+                    and str(r.get("text", "")).strip()
+                ]
+                project_lines = [
+                    str(r.get("text", "")).strip()
+                    for r in records
+                    if r.get("active", True) and not r.get("demoted")
+                    and self._sanitize_tag(r.get("tag")) == "PROJECT"
+                    and str(r.get("text", "")).strip()
+                ]
         if not profile_lines and not project_lines:
             return ""
 
@@ -1293,8 +1447,8 @@ class Memory:
         overlap = len(query_tokens & candidate_tokens)
         return overlap / math.sqrt(len(query_tokens) * len(candidate_tokens))
 
-    def _fast_recall(self, query: str, limit: int, include_chunks: bool) -> tuple[list[str], float]:
-        candidates = self._candidate_pool(include_chunks)
+    def _fast_recall(self, query: str, limit: int, include_facts: bool) -> tuple[list[str], float]:
+        candidates = self._candidate_pool(include_facts)
         scored: list[tuple[float, str]] = []
         for candidate in candidates:
             score = self._token_overlap_score(query, candidate)
@@ -1341,7 +1495,7 @@ class Memory:
     def _memory_vocabulary(self) -> set[str]:
         vocab: set[str] = set()
         candidates = self._merge_unique(
-            self._candidate_pool(include_chunks=True),
+            self._candidate_pool(include_facts=True),
             self._entity_candidates(""),
         )
         for candidate in candidates:
@@ -1377,7 +1531,7 @@ class Memory:
                 merged.append(item)
         return merged
 
-    def _candidate_pool(self, include_chunks: bool) -> list[str]:
+    def _candidate_pool(self, include_facts: bool) -> list[str]:
         payload = self._load_records_payload()
         records = payload.get("records", [])
         if not isinstance(records, list):
@@ -1386,13 +1540,14 @@ class Memory:
         for record in records:
             if not record.get("active", True):
                 continue
-            if not include_chunks and self._sanitize_tag(record.get("tag")) == "FACT":
+            if record.get("demoted"):
+                continue
+            if not include_facts and self._sanitize_tag(record.get("tag")) == "FACT":
                 continue
             text = str(record.get("text", "")).strip()
             if text:
                 candidates.append(text)
-        candidates.extend(self._trusted_chunk_candidates("PERSONAL"))
-        candidates.extend(self._trusted_chunk_candidates("PROJECT"))
+        # DO NOT read chunks - they are derived artifacts, records are source of truth
         return self._merge_unique(candidates)
 
     def _entity_candidates(self, query: str) -> list[str]:
@@ -1641,11 +1796,11 @@ class Memory:
         candidates: list[str],
         vector_hits: set[str] | None = None,
         score_modifiers: dict[str, float] | None = None,
+        allow_semantic: bool = True,
     ) -> tuple[list[str], float]:
         vector_hits = vector_hits or set()
         score_modifiers = score_modifiers or {}
-        semantic_scores = self._semantic_score_candidates(query_variants, candidates)
-        scored: list[tuple[float, str]] = []
+        lexical_scores: list[tuple[float, str]] = []
         for candidate in candidates:
             best_token_score = max((self._token_overlap_score(variant, candidate) for variant in query_variants), default=0.0)
             best_sequence_score = max(
@@ -1656,16 +1811,63 @@ class Memory:
                 (self._phrase_overlap_score(variant, candidate) for variant in query_variants),
                 default=0.0,
             )
-            best_score = best_token_score + (best_sequence_score * 0.2) + best_phrase_score + semantic_scores.get(candidate, 0.0)
+            lexical_score = best_token_score + (best_sequence_score * 0.2) + best_phrase_score
+            lexical_score += max((self._query_focus_bonus(variant, candidate) for variant in query_variants), default=0.0)
             if candidate in vector_hits:
-                best_score += 0.03
-            best_score += score_modifiers.get(candidate, 0.0)
-            if best_score > 0:
-                scored.append((best_score, candidate))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        if not scored:
+                lexical_score += 0.03
+            lexical_score += score_modifiers.get(candidate, 0.0)
+            if lexical_score > 0:
+                lexical_scores.append((lexical_score, candidate))
+
+        lexical_scores.sort(key=lambda item: item[0], reverse=True)
+        if not lexical_scores:
             return [], 0.0
+
+        # Semantic reranking is expensive. Apply it only to the strongest lexical slice
+        # instead of embedding the entire candidate pool on every first recall.
+        semantic_scores: dict[str, float] = {}
+        if allow_semantic:
+            semantic_window = [candidate for _, candidate in lexical_scores[: min(12, len(lexical_scores))]]
+            semantic_scores = self._semantic_score_candidates(query_variants, semantic_window)
+
+        scored = [
+            (score + semantic_scores.get(candidate, 0.0), candidate)
+            for score, candidate in lexical_scores
+        ]
+        scored.sort(key=lambda item: item[0], reverse=True)
         return self._merge_unique([candidate for _, candidate in scored]), scored[0][0]
+
+    def _semantic_retrieval_ready(self) -> bool:
+        current_state = self._memory_source_state()
+        return self._read_index_state() == current_state
+
+    def _query_focus_bonus(self, query: str, candidate: str) -> float:
+        lowered_query = query.lower()
+        lowered_candidate = candidate.lower()
+        bonus = 0.0
+
+        if any(marker in lowered_query for marker in ("name", "who am i")) and any(
+            marker in lowered_candidate for marker in ("name is ", "user's name", "the user name")
+        ):
+            bonus += 0.18
+
+        if any(marker in lowered_query for marker in ("school", "study")) and any(
+            marker in lowered_candidate for marker in ("school", "studies at", "study at")
+        ):
+            bonus += 0.18
+
+        if any(marker in lowered_query for marker in ("where do i live", "where i live", "live", "location", "where am i from", "from where")):
+            if any(marker in lowered_candidate for marker in ("live in", "lives in", "living in", "originally from", "from ")):
+                bonus += 0.18
+            elif "there" in lowered_candidate and "live" not in lowered_candidate:
+                bonus -= 0.06
+
+        if any(marker in lowered_query for marker in ("project", "working on", "build")) and any(
+            marker in lowered_candidate for marker in ("working on", "building", "project", "app", "website", "assistant")
+        ):
+            bonus += 0.12
+
+        return bonus
 
     def _semantic_score_candidates(self, query_variants: list[str], candidates: list[str]) -> dict[str, float]:
         unique_candidates = [candidate for candidate in self._merge_unique(candidates) if candidate]
@@ -1673,6 +1875,10 @@ class Memory:
             return {}
         embedder = self._get_embedder()
         if embedder is None:
+            return {}
+
+        # Skip semantic scoring if we have very few candidates (lexical is enough)
+        if len(unique_candidates) <= 3:
             return {}
 
         candidate_key = tuple(unique_candidates)
@@ -1686,11 +1892,19 @@ class Memory:
             self._semantic_candidate_cache_key = candidate_key
             self._semantic_candidate_cache_embeddings = candidate_embeddings
 
-        try:
-            query_embeddings_raw = embedder.encode(query_variants).tolist()
-        except Exception:
-            return {}
-        query_embeddings = [self._normalize_embedding(vector) for vector in query_embeddings_raw]
+        # Cache query embeddings keyed by the variants tuple to avoid re-encoding on every call
+        query_key = tuple(query_variants)
+        if query_key not in self._query_embedding_cache:
+            try:
+                raw_query = embedder.encode(query_variants).tolist()
+                self._query_embedding_cache[query_key] = [self._normalize_embedding(v) for v in raw_query]
+                # Keep cache bounded — drop oldest entries beyond 32
+                if len(self._query_embedding_cache) > 32:
+                    oldest = next(iter(self._query_embedding_cache))
+                    del self._query_embedding_cache[oldest]
+            except Exception:
+                return {}
+        query_embeddings = self._query_embedding_cache[query_key]
 
         scores: dict[str, float] = {}
         for candidate, candidate_embedding in zip(unique_candidates, candidate_embeddings):
@@ -1887,25 +2101,30 @@ class Memory:
         return items
 
     def _memory_source_state(self) -> dict[str, Any]:
-        files: list[dict[str, Any]] = []
-        for path in [
-            self.records_path,
-            self.entities_path,
-            self.profile_path,
-            self.projects_path,
-            *sorted(self.chunks_dir.glob("*.txt")),
-        ]:
-            if not path.exists():
+        # Fingerprint only the record content that actually feeds the vector index.
+        # Retrieval counters/timestamps should not invalidate semantic readiness.
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            records = []
+        indexed_snapshot: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
                 continue
-            stat = path.stat()
-            files.append(
+            indexed_snapshot.append(
                 {
-                    "path": str(path.resolve()),
-                    "mtime_ns": stat.st_mtime_ns,
-                    "size": stat.st_size,
+                    "id": str(record.get("id", "")).strip(),
+                    "tag": self._sanitize_tag(record.get("tag")),
+                    "text": str(record.get("text", "")).strip(),
+                    "active": bool(record.get("active", True)),
+                    "demoted": bool(record.get("demoted")),
                 }
             )
-        return {"files": files}
+        indexed_snapshot.sort(key=lambda item: (item["id"], item["tag"], item["text"]))
+        digest = hashlib.sha256(
+            json.dumps(indexed_snapshot, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return {"records_digest": digest, "count": len(indexed_snapshot)}
 
     def _read_index_state(self) -> dict[str, Any] | None:
         if not self.index_state_path.exists():

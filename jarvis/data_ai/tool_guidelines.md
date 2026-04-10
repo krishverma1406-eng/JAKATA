@@ -1,28 +1,39 @@
-| Tool | Use When | Notes |
-|---|---|---|
-| `web_search` | The user asks about news, current events, prices, recent facts, or anything that changes over time | Returns structured citations. Can fetch full page text when needed. Tavily is primary; Brave fallback works only if a Brave key is configured |
-| `datetime_tool` | The user asks for the current time, date, day, timezone conversion, or scheduling context | Use before answering time/date questions |
-| `file_manager` | The user says open, read, save, write, list, find, search inside files, copy, move, delete, create folders, inspect PDFs, inspect `.docx`, or check whether files changed | Prefer this for structured filesystem work. Confirm before overwriting, delete, or replacing an existing destination. `watch` is manual polling, not background notifications |
-| `browser_control` | A task needs a real browser page opened, clicked, typed into, extracted, scrolled, waited on, screenshotted, or evaluated with JavaScript | Uses Amazon Nova Act with a persistent browser session per JARVIS session. Supports deterministic actions like `open`, `click`, `type`, `extract`, `screenshot`, `scroll`, `wait`, `evaluate`, `fill_form`, legacy `fetch`, and prompt-driven `act` tasks |
-| `memory_query` | The user asks personal questions, refers to past conversations, preferences, projects, prior commitments, asks things like "what do you know about me", "who am I", "who is Shaurya", "remember that ...", or "forget what I said about ..." | Use this for memory search, explicit remember, explicit forget, and entity lookups |
-| `reminder_tool` | The user asks to set, list, delete, or check reminders | Stores reminders in `data_user/reminders.json` and due reminders can be surfaced on startup |
-| `clipboard_tool` | The user wants to inspect, copy, replace, or clear clipboard text | Good for summarizing or reusing copied text |
-| `notes_tool` | The user wants intentional notes created, read, searched, listed, or deleted | Uses markdown notes in `data_user/notes`, separate from auto memory |
-| `calculator_tool` | The user asks for math, arithmetic, or unit conversions | Prefer this over mental math. Supports arithmetic and basic unit conversions |
-| `system_info_tool` | The user asks about CPU, RAM, disk, battery, or running processes | Uses live system metrics through `psutil` |
-| `weather_tool` | The user asks about weather or forecast | Uses OpenWeatherMap and can infer location from memory/profile when available |
-| `gmail_tool` | The user asks to read unread email, search inbox, or send email | Requires Gmail OAuth setup and client secret/token files |
-| `calendar_tool` | The user asks for today's events or to create a calendar event | Requires Google Calendar OAuth setup and client secret/token files |
-| `screenshot_tool` | The user asks to capture the screen or analyze a screenshot | Can capture and can attempt backend vision analysis when supported. Useful as the inspection step before downstream desktop actions |
-| `app_launcher_tool` | The user asks to launch a local application by name | Uses local app resolution and OS launch behavior |
-| `session_tool` | The user asks to rename the current session, list recent sessions, inspect the current session, or search discussions from a specific named session | Use this for explicit session management and session search, not for general personal memory |
-| `code_writer` | The user explicitly asks JARVIS to create a new tool, scaffold a feature, or write tool code | Generates code, validates importability, dry-runs `execute()`, and logs success. Do not use silently |
-| `music_player` | The user asks to play or manage local music playback, a local folder, or a direct YouTube URL | Uses VLC. Supports local files, folders, fuzzy search, queue/status, volume, and some YouTube URLs via `yt-dlp`. Do not use this for generic browser YouTube search or browser playback tasks |
-| `os_control` | The task needs desktop actions such as screenshots, mouse clicks, typing, scrolling, hotkeys, dragging, or opening local apps | Coordinate-based desktop control. Pair it with `screenshot_tool` when screen understanding or vision-guided desktop actions are needed |
-| `terminal_tool` | The task needs real command-line access, PowerShell or cmd help, command discovery, shell-based search, or app-launch fallback when higher-level tools are insufficient | Prefer PowerShell for Windows discovery and search. Useful patterns include `Get-Help`, `Get-Command`, `Get-ChildItem`, `Select-String`, and `Start-Process`. Confirm before destructive commands |
+## Tool Selection Reference
 
-For `gmail_tool`, summarize sender, subject, date, and whether action is needed instead of dumping raw message objects unless the user asks for raw details.
+| Tool | Trigger Words | Requires Setup | Fallback |
+|---|---|---|---|
+| `web_search` | news, current, price, recent, latest | Tavily or Brave API key | none |
+| `datetime_tool` | time, date, day, timezone | none | none |
+| `file_manager` | read, write, list, find, copy, move, delete, PDF, docx | none | terminal_tool |
+| `browser_control` | open website, click, type in browser, extract page | Nova Act API key | web_search |
+| `memory_query` | remember, who am I, what do you know, forget, my project | none | none |
+| `reminder_tool` | remind me, set reminder, list reminders | none | notes_tool |
+| `clipboard_tool` | clipboard, copy this, paste | none | none |
+| `notes_tool` | save note, create note, find note | none | none |
+| `calculator_tool` | calculate, math, convert units | none | inline math |
+| `system_info_tool` | CPU, RAM, battery, disk, processes | psutil installed | none |
+| `weather_tool` | weather, forecast, temperature | OpenWeatherMap key | web_search |
+| `gmail_tool` | email, inbox, send mail | Gmail OAuth | STOP if not set up |
+| `calendar_tool` | calendar, events, schedule | Calendar OAuth | STOP if not set up |
+| `screenshot_tool` | screenshot, what's on screen, analyze screen | none | os_control |
+| `app_launcher_tool` | open Spotify, launch VS Code, open [app] | none | terminal_tool |
+| `session_tool` | rename session, list sessions, past session | none | none |
+| `code_writer` | create a tool, write tool code, scaffold | none | none |
+| `music_player` | play local music, local file, play [file path] | VLC installed | browser_control |
+| `os_control` | click at, type on desktop, hotkey, drag | pyautogui installed | none |
+| `terminal_tool` | PowerShell, cmd, run command, terminal | none | none |
 
-For `calendar_tool`, summarize event title, start time, end time, and location instead of dumping raw event objects unless the user asks for raw details.
+## Output Rules
 
-For `session_tool`, prefer searching or renaming session metadata when the user explicitly refers to a session by name, says "rename this session", or asks what was discussed in a specific session.
+- `gmail_tool`: summarize sender, subject, date, action needed. No raw JSON.
+- `calendar_tool`: summarize title, start, end, location. No raw JSON.
+- `browser_control`: report URL, title, and what was extracted/done. No raw HTML.
+- All tools: if `ok: false`, report the exact error. Do not paper over failures.
+
+## Tool Abuse Prevention
+
+- Do NOT use `code_writer` silently — only when user explicitly asks
+- Do NOT use `session_tool` for personal memory — that's `memory_query`
+- Do NOT use `music_player` for YouTube browser search — that's `browser_control`
+- Do NOT use `terminal_tool` instead of `file_manager` for basic file ops
+- Do NOT call `browser_control` if Nova Act API key is missing

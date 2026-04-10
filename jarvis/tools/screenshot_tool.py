@@ -14,7 +14,7 @@ from services import os_control
 
 TOOL_DEFINITION = {
     "name": "screenshot_tool",
-    "description": "Capture a screenshot and optionally analyze it with the configured live backend.",
+    "description": "Capture a screenshot and optionally analyze it with the configured live backend, including custom prompts for OCR, UI inspection, or coordinate-style guidance.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -48,11 +48,11 @@ def execute(params: dict[str, Any]) -> dict[str, Any]:
         if not target_path:
             target_path = str(os_control.screenshot()["path"])
         prompt = str(params.get("prompt", "")).strip() or "Describe what is visible on this screen."
-        return _analyze_screenshot(Path(target_path), prompt)
+        return analyze_image_path(Path(target_path), prompt)
     return {"ok": False, "error": f"Unsupported action: {action}"}
 
 
-def _analyze_screenshot(path: Path, prompt: str) -> dict[str, Any]:
+def analyze_image_path(path: Path, prompt: str) -> dict[str, Any]:
     if not path.exists():
         return {"ok": False, "error": f"Screenshot does not exist: {path}"}
 

@@ -22,6 +22,7 @@ JAKATA is a modular Python desktop AI assistant focused on practical personal pr
   - file management
   - web search
   - desktop control
+  - browser automation through Amazon Nova Act
 
 ## Project Layout
 

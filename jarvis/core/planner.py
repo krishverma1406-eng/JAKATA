@@ -13,27 +13,104 @@ from core.tool_registry import ToolRegistry
 class Planner:
     """Decide when a request needs a multi-step plan and build one."""
 
+    _SIMPLE_MESSAGES = {
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "yo",
+        "sup",
+        "ok",
+        "okay",
+    }
+    _MULTI_STEP_MARKERS = (
+        " and ",
+        " then ",
+        " after ",
+        " after that ",
+        " before ",
+        " also ",
+        " while ",
+        " once ",
+        " when done ",
+        " followed by ",
+    )
+    _ACTION_MARKERS = {
+        "open",
+        "launch",
+        "start",
+        "play",
+        "pause",
+        "stop",
+        "show",
+        "list",
+        "read",
+        "write",
+        "save",
+        "find",
+        "search",
+        "take",
+        "capture",
+        "analyze",
+        "describe",
+        "click",
+        "type",
+        "scroll",
+        "drag",
+        "remember",
+        "remind",
+        "rename",
+        "send",
+        "create",
+        "build",
+        "fix",
+        "debug",
+        "summarize",
+        "check",
+        "review",
+        "compare",
+    }
+    _DIRECT_SINGLE_ACTION_PREFIX = re.compile(
+        r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
+        r"(?:open|launch|start|play|pause|stop|show|list|read|write|save|find|search|take|capture|analyze|describe|"
+        r"click|type|scroll|drag|remember|remind|rename|send|create|build|fix|debug|summarize|check|review|compare)\b"
+    )
+
     def __init__(self, brain: Brain | None = None) -> None:
         self.brain = brain or Brain()
 
-    def should_plan(self, task: str) -> bool:
+    def should_plan(
+        self,
+        task: str,
+        tool_definitions: list[dict[str, Any]] | None = None,
+    ) -> bool:
         if self._looks_simple(task):
             return False
-        return self._looks_complex(task)
+        if self._is_single_action_request(task, tool_definitions or []):
+            return False
+        return self._looks_complex(task, tool_definitions or [])
 
     def create_plan(
         self,
         task: str,
         tool_definitions: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if not self.should_plan(task):
+        if not self.should_plan(task, tool_definitions):
             return {"needs_planning": False, "steps": []}
 
         planner_prompt = (
-            "Break the user request into ordered execution steps.\n"
-            'Return strict JSON shaped as {"steps": [{"step": "short description", '
-            '"tool_name": "tool or null"}]}.\n'
-            "Only reference tools from the provided tool list. Use null when no tool is necessary."
+            "You are the high-level planning layer for a tool-using assistant.\n"
+            "Decide the minimum plan needed for a genuinely multi-stage user request.\n"
+            'Return strict JSON shaped as {"needs_planning": true, "strategy": "short summary", '
+            '"steps": [{"step": "high-level phase", "tool_name": "primary tool or null", '
+            '"tool_names": ["optional", "tool", "list"]}]}.\n'
+            "Rules:\n"
+            "- Only create plans for larger tasks with dependent stages, coordination, or multiple likely tools.\n"
+            "- Use 2 to 5 high-level phases, not tiny actions like individual clicks, waits, or keystrokes.\n"
+            "- A step may list multiple tools when the assistant may need to chain them.\n"
+            "- Only reference tools from the provided tool list.\n"
+            "- Use null or an empty list when a step is reasoning-only."
         )
         tool_list = ", ".join(tool["name"] for tool in tool_definitions) or "no tools available"
         response = self.brain.chat(
@@ -48,23 +125,34 @@ class Planner:
         payload = self._parse_json(response.get("content", ""))
         if isinstance(payload, dict) and isinstance(payload.get("steps"), list):
             steps = []
+            strategy = str(payload.get("strategy", "")).strip()
             for item in payload["steps"]:
                 if not isinstance(item, dict):
                     continue
                 step_text = str(item.get("step", "")).strip()
                 if not step_text:
                     continue
+                tool_names = self._normalize_tool_names(item.get("tool_names"), tool_definitions)
+                primary_tool = str(item.get("tool_name", "") or "").strip() or None
+                if primary_tool and primary_tool not in tool_names:
+                    if primary_tool in {tool["name"] for tool in tool_definitions}:
+                        tool_names = [primary_tool, *tool_names]
                 steps.append(
                     {
                         "step": step_text,
-                        "tool_name": item.get("tool_name"),
+                        "tool_name": tool_names[0] if tool_names else primary_tool,
+                        "tool_names": tool_names,
                         "status": "pending",
                     }
                 )
             if steps:
-                return {"needs_planning": True, "steps": steps}
+                return {"needs_planning": True, "strategy": strategy, "steps": steps}
 
-        return {"needs_planning": True, "steps": self._fallback_steps(task, tool_definitions)}
+        return {
+            "needs_planning": True,
+            "strategy": "Coordinate the larger task in phases and chain tools only where results are needed.",
+            "steps": self._fallback_steps(task, tool_definitions),
+        }
 
     def render_plan(self, plan: dict[str, Any]) -> str:
         steps = plan.get("steps", [])
@@ -72,8 +160,11 @@ class Planner:
             return "No explicit plan required."
 
         lines = ["Execution plan:"]
+        strategy = str(plan.get("strategy", "")).strip()
+        if strategy:
+            lines.append(f"Strategy: {strategy}")
         for index, step in enumerate(steps, start=1):
-            tool_name = step.get("tool_name") or "no tool specified"
+            tool_name = ", ".join(self._step_tool_names(step)) or "no tool specified"
             status = step.get("status", "pending")
             lines.append(f"{index}. {step.get('step', '').strip()} [{tool_name}] ({status})")
         return "\n".join(lines)
@@ -82,7 +173,7 @@ class Planner:
         for index, step in enumerate(plan.get("steps", [])):
             if step.get("status") != "pending":
                 continue
-            if step.get("tool_name") == tool_name:
+            if tool_name in self._step_tool_names(step):
                 return index
         return None
 
@@ -105,40 +196,49 @@ class Planner:
         if fallback_index is not None:
             steps[fallback_index]["status"] = "completed"
 
-    def _looks_complex(self, task: str) -> bool:
+    def _looks_complex(
+        self,
+        task: str,
+        tool_definitions: list[dict[str, Any]],
+    ) -> bool:
         lowered = task.lower()
-        multi_step_markers = (
-            " and ",
-            " then ",
-            " after ",
-            " before ",
-            " remind ",
-            " also ",
-            " while ",
-        )
+        word_count = len(task.split())
+        marker_hits = sum(1 for marker in self._MULTI_STEP_MARKERS if marker in lowered)
+        action_count = self._estimated_action_count(task)
+        likely_tool_count = len(self._likely_tool_names(task, tool_definitions))
         return (
-            len(task.split()) >= self.brain.settings.planner_complex_word_limit
-            or any(marker in lowered for marker in multi_step_markers)
+            marker_hits > 0
+            or action_count >= 2
+            or likely_tool_count >= 2
+            or (
+                word_count >= self.brain.settings.planner_complex_word_limit
+                and (action_count >= 2 or likely_tool_count >= 1)
+            )
         )
 
     def _looks_simple(self, task: str) -> bool:
         lowered = task.lower().strip()
         word_count = len(lowered.split())
-        simple_markers = {
-            "hi",
-            "hello",
-            "hey",
-            "thanks",
-            "thank you",
-            "yo",
-            "sup",
-            "ok",
-            "okay",
-        }
         return (
-            lowered in simple_markers
+            lowered in self._SIMPLE_MESSAGES
             or word_count <= self.brain.settings.planner_simple_word_limit
         )
+
+    def _is_single_action_request(
+        self,
+        task: str,
+        tool_definitions: list[dict[str, Any]],
+    ) -> bool:
+        lowered = task.lower().strip()
+        if not lowered:
+            return True
+        if any(marker in lowered for marker in self._MULTI_STEP_MARKERS):
+            return False
+        action_count = self._estimated_action_count(task)
+        likely_tool_count = len(self._likely_tool_names(task, tool_definitions))
+        if likely_tool_count <= 1 and action_count <= 1:
+            return True
+        return bool(self._DIRECT_SINGLE_ACTION_PREFIX.match(lowered) and action_count <= 1)
 
     def _fallback_steps(
         self,
@@ -151,21 +251,87 @@ class Planner:
             cleaned = fragment.strip(" ,.")
             if not cleaned:
                 continue
+            guessed_tools = self._guess_tools(cleaned, tool_definitions)
             steps.append(
                 {
                     "step": cleaned,
-                    "tool_name": self._guess_tool(cleaned, tool_definitions),
+                    "tool_name": guessed_tools[0] if guessed_tools else None,
+                    "tool_names": guessed_tools,
                     "status": "pending",
                 }
             )
-        return steps or [{"step": task.strip(), "tool_name": None, "status": "pending"}]
+        if steps:
+            return steps
+        guessed_tools = self._guess_tools(task.strip(), tool_definitions)
+        return [{
+            "step": task.strip(),
+            "tool_name": guessed_tools[0] if guessed_tools else None,
+            "tool_names": guessed_tools,
+            "status": "pending",
+        }]
 
-    def _guess_tool(self, fragment: str, tool_definitions: list[dict[str, Any]]) -> str | None:
-        available_tool_names = {tool["name"] for tool in tool_definitions}
-        best_name = ToolRegistry.best_matching_tool_name(fragment, tool_definitions, min_score=1.5)
-        if best_name in available_tool_names:
-            return best_name
-        return None
+    def _guess_tools(self, fragment: str, tool_definitions: list[dict[str, Any]]) -> list[str]:
+        ranked = ToolRegistry.rank_tool_definitions(fragment, tool_definitions)
+        if not ranked:
+            return []
+        top_score = ranked[0][1]
+        selected: list[str] = []
+        for tool_definition, score in ranked:
+            if score < 1.5:
+                break
+            if top_score > 0 and score < max(1.5, top_score * 0.6):
+                continue
+            selected.append(str(tool_definition["name"]))
+            if len(selected) >= 3:
+                break
+        return selected
+
+    def _likely_tool_names(
+        self,
+        task: str,
+        tool_definitions: list[dict[str, Any]],
+    ) -> list[str]:
+        return self._guess_tools(task, tool_definitions)
+
+    def _estimated_action_count(self, task: str) -> int:
+        tokens = re.findall(r"[a-z0-9]+", task.lower())
+        if not tokens:
+            return 0
+        action_hits = {token for token in tokens if token in self._ACTION_MARKERS}
+        connector_hits = sum(1 for marker in self._MULTI_STEP_MARKERS if marker in f" {task.lower()} ")
+        return max(len(action_hits), connector_hits + 1 if connector_hits else len(action_hits))
+
+    def _normalize_tool_names(
+        self,
+        raw_tool_names: Any,
+        tool_definitions: list[dict[str, Any]],
+    ) -> list[str]:
+        allowed = {tool["name"] for tool in tool_definitions}
+        if isinstance(raw_tool_names, str):
+            raw_tool_names = [raw_tool_names]
+        if not isinstance(raw_tool_names, list):
+            return []
+
+        normalized: list[str] = []
+        for item in raw_tool_names:
+            name = str(item or "").strip()
+            if not name or name not in allowed or name in normalized:
+                continue
+            normalized.append(name)
+        return normalized
+
+    def _step_tool_names(self, step: dict[str, Any]) -> list[str]:
+        seen: list[str] = []
+        tool_name = str(step.get("tool_name", "") or "").strip()
+        if tool_name:
+            seen.append(tool_name)
+        tool_names = step.get("tool_names", [])
+        if isinstance(tool_names, list):
+            for item in tool_names:
+                value = str(item or "").strip()
+                if value and value not in seen:
+                    seen.append(value)
+        return seen
 
     def _parse_json(self, value: Any) -> Any:
         if isinstance(value, (dict, list)):

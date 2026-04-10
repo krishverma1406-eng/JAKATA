@@ -24,6 +24,9 @@ Too many real memory queries get skipped. Either expand keywords aggressively or
 **1.6 — Upgrade `_task_kind` detection**
 `"help me build a Python script"` doesn't trigger code model. Broaden the keyword list so Gemini 2.5 Pro is actually used for coding tasks.
 
+**1.7 — Planner gating + orchestration**
+Planner should not run for every medium-length request. Upgrade it so it only activates for genuinely bigger or dependent tasks, creates high-level phases instead of tiny substeps, and can suggest multiple tools per phase when a task needs tool chaining. The planner is the coordinator, not the executor.
+
 ---
 
 ## Phase 2 — Voice Layer (Makes it Feel Like JARVIS)
@@ -79,6 +82,14 @@ Current version is 3 lines. Upgrade using `pyautogui` + `Pillow`:
 - Type text anywhere
 - Open apps by name
 - Scroll, drag, hotkeys
+
+Vision-guided clicking should work as a chained workflow, not a magic hardcoded special case:
+- Take screenshot
+- Ask vision model where the target UI element is and request pixel coordinates
+- Parse coordinates from the analysis
+- Use `os_control` to click there
+
+That same pattern should extend beyond screenshots plus mouse clicks. Bigger tasks should let planner coordinate whichever tools are needed, chain outputs between them, and skip planning entirely for smaller one-shot requests.
 
 **3.5 — `file_manager.py` → Enhanced**
 Add:

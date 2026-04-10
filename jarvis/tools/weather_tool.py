@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
@@ -59,13 +60,32 @@ def execute(params: dict[str, Any]) -> dict[str, Any]:
 
 def _infer_location() -> str:
     memory = Memory()
-    hits = memory.recall("where do i live city location", 8)
+    hits = memory.recall("current city location where do i live currently", 8)
     for hit in hits:
-        lowered = hit.lower()
-        if "delhi" in lowered:
-            return "Delhi, India"
-        if "hisar" in lowered:
-            return "Hisar, Haryana, India"
+        candidate = _extract_location_candidate(hit)
+        if candidate:
+            return candidate
+    return ""
+
+
+def _extract_location_candidate(text: str) -> str:
+    cleaned = re.sub(r"[*_`#>\-\[\]]", " ", str(text or "")).strip()
+    if not cleaned:
+        return ""
+
+    patterns = (
+        r"(?i)\blocation\b[^A-Za-z]+([A-Za-z][A-Za-z .'-]*(?:,\s*[A-Za-z][A-Za-z .'-]*){0,2})",
+        r"(?i)\b(?:live|lives|living|currently in|based in|study in|studies in)\b[^A-Za-z]+([A-Za-z][A-Za-z .'-]*(?:,\s*[A-Za-z][A-Za-z .'-]*){0,2})",
+        r"(?i)\bin ([A-Za-z][A-Za-z .'-]*(?:,\s*[A-Za-z][A-Za-z .'-]*){0,2})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if not match:
+            continue
+        candidate = re.sub(r"\s+", " ", match.group(1)).strip(" ,.-")
+        candidate = re.sub(r"(?i)^(?:in|at|from)\s+", "", candidate).strip(" ,.-")
+        if candidate:
+            return candidate
     return ""
 
 

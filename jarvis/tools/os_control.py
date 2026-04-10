@@ -9,7 +9,7 @@ from services import os_control as desktop
 
 TOOL_DEFINITION = {
     "name": "os_control",
-    "description": "Take screenshots and control the local desktop with clicks, typing, scrolling, and hotkeys.",
+    "description": "Control the local desktop with screenshots, coordinate-based clicks, typing, scrolling, hotkeys, dragging, and app launching. Pair with screenshot analysis when screen understanding is required.",
     "parameters": {
         "type": "object",
         "properties": {

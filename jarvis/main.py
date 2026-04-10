@@ -412,6 +412,8 @@ def _run_agent_stream(
     def _event_handler(event: dict[str, Any]) -> None:
         event_type = event.get("type")
         if event_type == "tool_started":
+            if not mode_config.get("show_debug"):
+                return
             name = str(event.get("name", "")).strip()
             arguments = json.dumps(event.get("arguments", {}), ensure_ascii=False, default=str)
             _safe(lambda: renderer.tool(f"TOOL > {name} {arguments}"))

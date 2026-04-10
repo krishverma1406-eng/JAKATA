@@ -81,7 +81,7 @@ class ToolRegistry:
             if runtime_context:
                 payload["_runtime_context"] = dict(runtime_context)
             result = self._executors[name](payload)
-            return {"ok": True, "name": name, "result": result}
+            return self._normalize_tool_result(name, result)
         except Exception as exc:
             return {"ok": False, "name": name, "error": str(exc)}
 
@@ -89,6 +89,15 @@ class ToolRegistry:
     def errors(self) -> dict[str, str]:
         self.refresh()
         return dict(self._errors)
+
+    @staticmethod
+    def _normalize_tool_result(name: str, result: Any) -> dict[str, Any]:
+        if isinstance(result, dict):
+            normalized = dict(result)
+            normalized["name"] = name
+            normalized.setdefault("ok", True)
+            return normalized
+        return {"ok": True, "name": name, "result": result}
 
     @staticmethod
     def rank_tool_definitions(

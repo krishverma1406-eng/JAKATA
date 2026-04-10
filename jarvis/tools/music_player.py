@@ -17,7 +17,7 @@ _STATE: dict[str, Any] = {
 
 TOOL_DEFINITION = {
     "name": "music_player",
-    "description": "Play local music or YouTube audio and control playback.",
+    "description": "Play local music files, local folders, or direct YouTube URLs through VLC. Do not use this for generic browser music search or browser playback tasks.",
     "parameters": {
         "type": "object",
         "properties": {

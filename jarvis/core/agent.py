@@ -141,7 +141,7 @@ class Agent:
                 turn_meta={"mode": self.mode, "tool_count": 0},
             )
 
-        messages = self._build_messages(user_message, memory_context, plan_note, mode_config)
+        messages = self._build_messages(user_message, memory_context, plan, plan_note, mode_config)
         tool_trace: list[dict[str, Any]] = []
         task_kind = self._task_kind(user_message, plan)
         total_started_at = time.perf_counter()
@@ -179,7 +179,7 @@ class Agent:
                 )
 
             if not tool_calls:
-                final_answer = response.get("content", "").strip() or "No response generated."
+                final_answer = self._resolve_final_answer(response, tool_trace)
                 return self._finalize_response(
                     user_message,
                     final_answer,
@@ -274,6 +274,7 @@ class Agent:
         self,
         user_message: str,
         memory_context: list[str],
+        plan: dict[str, Any],
         plan_note: str,
         mode_config: dict[str, Any],
     ) -> list[dict[str, Any]]:
@@ -307,10 +308,20 @@ class Agent:
 
         if plan_note and plan_note != "No explicit plan required.":
             messages.append({"role": "system", "content": plan_note})
+        if plan.get("needs_planning"):
+            messages.append({"role": "system", "content": self._plan_execution_guidance()})
 
         messages.extend(self.history[-8:])
         messages.append({"role": "user", "content": user_message})
         return messages
+
+    def _plan_execution_guidance(self) -> str:
+        return (
+            "Use the plan as high-level execution guidance only.\n"
+            "Do not create micro-steps or call tools just because they appear in the plan.\n"
+            "Choose the next necessary tool based on the latest tool result, and chain tools when one output unlocks the next action.\n"
+            "Prefer inspection before action when state is uncertain, especially for browser, desktop, file, and screenshot-driven tasks."
+        )
 
     def _load_memory_context(self, user_message: str) -> list[str]:
         if not self._should_query_memory(user_message):
@@ -503,21 +514,46 @@ class Agent:
         )
         if memory_query_only or any(marker in lowered for marker in recall_markers):
             return False
+        if "?" in lowered:
+            return False
+        if any(
+            lowered.startswith(prefix)
+            for prefix in (
+                "open ",
+                "search ",
+                "play ",
+                "list ",
+                "show ",
+                "tell me",
+                "what ",
+                "who ",
+                "where ",
+                "when ",
+                "why ",
+                "how ",
+                "can you",
+                "could you",
+                "please ",
+                "pls ",
+            )
+        ):
+            return False
         extract_markers = (
-            "remember",
-            "my ",
-            "i like",
-            "i am",
-            "project",
-            "working on",
-            "build",
-            "preference",
-            "always",
-            "never",
+            "remember ",
+            "my name is ",
+            "i am ",
+            "i'm ",
+            "i live ",
+            "i study ",
+            "my school ",
+            "i like ",
+            "i prefer ",
+            "i want ",
+            "i'm working on ",
+            "i am working on ",
+            "my project ",
         )
-        if any(marker in lowered for marker in extract_markers):
-            return True
-        return bool(tool_trace)
+        return any(marker in lowered for marker in extract_markers)
 
     def _select_tool_definitions(
         self,
@@ -527,6 +563,19 @@ class Agent:
         memory_context: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         requested_tools: set[str] = set()
+        lowered = user_message.lower().strip()
+        simple_chat_markers = {
+            "hi",
+            "hello",
+            "hey",
+            "yo",
+            "sup",
+            "thanks",
+            "thank you",
+            "ok",
+            "okay",
+        }
+        forced_tools = self._forced_tool_names(user_message, all_tool_definitions)
         ranked_tools = ToolRegistry.rank_tool_definitions(user_message, all_tool_definitions)
         top_score = ranked_tools[0][1] if ranked_tools else 0.0
         max_selected = 1 if 0 < top_score <= 1.5 else 4
@@ -543,12 +592,25 @@ class Agent:
             tool_name = step.get("tool_name")
             if tool_name:
                 requested_tools.add(str(tool_name))
+            for extra_tool_name in step.get("tool_names", []):
+                if extra_tool_name:
+                    requested_tools.add(str(extra_tool_name))
 
-        if memory_context:
+        requested_tools.update(forced_tools)
+
+        if memory_context and "memory_query" not in forced_tools:
             requested_tools.discard("memory_query")
 
+        if "browser_control" in requested_tools and any(
+            marker in lowered for marker in ("youtube", "youtu.be", "spotify web", "soundcloud")
+        ):
+            requested_tools.discard("music_player")
+
+        if lowered in simple_chat_markers:
+            return []
+
         if not requested_tools:
-            return [] if memory_context else all_tool_definitions
+            return []
 
         selected_tool_definitions = [
             tool_definition
@@ -557,7 +619,179 @@ class Agent:
         ]
         if selected_tool_definitions:
             return selected_tool_definitions
-        return [] if memory_context else all_tool_definitions
+        return []
+
+    def _forced_tool_names(
+        self,
+        user_message: str,
+        all_tool_definitions: list[dict[str, Any]],
+    ) -> set[str]:
+        lowered = user_message.lower().strip()
+        available = {str(tool_definition["name"]) for tool_definition in all_tool_definitions}
+        forced: set[str] = set()
+
+        if any(
+            marker in lowered
+            for marker in (
+                "session",
+                "rename this session",
+                "rename session",
+                "recent sessions",
+                "past session",
+                "current session",
+            )
+        ):
+            forced.add("session_tool")
+
+        if any(
+            marker in lowered
+            for marker in (
+                "what time",
+                "whats the time",
+                "what's the time",
+                "current time",
+                "time now",
+                "today date",
+                "current date",
+                "what day",
+                "today day",
+            )
+        ):
+            forced.add("datetime_tool")
+
+        if any(
+            marker in lowered
+            for marker in (
+                "system info",
+                "cpu",
+                "ram",
+                "battery",
+                "disk",
+                "storage",
+                "running processes",
+                "process list",
+            )
+        ):
+            forced.add("system_info_tool")
+
+        if any(marker in lowered for marker in ("weather", "forecast", "temperature")):
+            forced.add("weather_tool")
+
+        if any(
+            marker in lowered
+            for marker in (
+                "who am i",
+                "what do you know about me",
+                "what is my",
+                "my school",
+                "school name",
+                "where do i live",
+                "where i live",
+                "about me",
+                "remember that",
+                "forget that",
+            )
+        ):
+            forced.add("memory_query")
+
+        if any(
+            marker in lowered
+            for marker in (
+                "download",
+                "downloads",
+                "dowload",
+                "file",
+                "files",
+                "folder",
+                "read ",
+                "list ",
+                "find file",
+                "save ",
+                "write ",
+            )
+        ):
+            forced.add("file_manager")
+
+        if any(
+            marker in lowered
+            for marker in (
+                "youtube",
+                "browser",
+                "website",
+                "web page",
+                ".com",
+                "http://",
+                "https://",
+            )
+        ) and any(
+            marker in lowered
+            for marker in (
+                "open",
+                "search",
+                "play",
+                "click",
+                "type",
+                "go to",
+            )
+        ):
+            forced.add("browser_control")
+
+        if "browser_control" in forced:
+            forced.discard("app_launcher_tool")
+            if any(marker in lowered for marker in ("youtube", "youtu.be", "spotify web", "soundcloud")):
+                forced.discard("music_player")
+        if "datetime_tool" in forced:
+            forced.discard("system_info_tool")
+        if "memory_query" in forced:
+            forced.discard("session_tool")
+
+        return forced & available
+
+    def _resolve_final_answer(
+        self,
+        response: dict[str, Any],
+        tool_trace: list[dict[str, Any]],
+    ) -> str:
+        content = str(response.get("content", "")).strip()
+        if content:
+            return content
+        if not tool_trace:
+            return "No response generated."
+
+        failures = [
+            item for item in tool_trace
+            if isinstance(item.get("result"), dict) and item["result"].get("ok") is False
+        ]
+        if failures:
+            failed = failures[-1]
+            result = failed.get("result", {})
+            error = str(result.get("error", "")).strip() or "unknown error"
+            return f"{failed.get('name', 'tool')} failed: {error}"
+
+        last = tool_trace[-1]
+        result = last.get("result", {})
+        tool_name = str(last.get("name", "")).strip()
+        if isinstance(result, dict):
+            if tool_name == "datetime_tool" and result.get("time"):
+                return f"The current time is {result.get('time')}."
+            if tool_name == "weather_tool" and result.get("location") and result.get("description"):
+                return (
+                    f"The weather in {result.get('location')} is {result.get('description')} "
+                    f"at {result.get('temperature')} degrees."
+                )
+            if tool_name == "system_info_tool" and any(key in result for key in ("cpu_percent", "ram_percent", "disk_percent")):
+                return (
+                    f"CPU {result.get('cpu_percent')}%, RAM {result.get('ram_percent')}%, "
+                    f"disk {result.get('disk_percent')}%."
+                )
+            if tool_name == "file_manager":
+                items = result.get("items")
+                if isinstance(items, list):
+                    return f"I found {len(items)} items in {result.get('path', 'that folder')}."
+            if tool_name == "browser_control":
+                return "The browser action ran, but I couldn't produce a clean final summary."
+
+        return "The requested action ran, but I couldn't produce a final summary."
 
     def _remember_turn(self, user_message: str, assistant_message: str) -> None:
         self.history.append({"role": "user", "content": user_message})

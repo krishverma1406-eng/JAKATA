@@ -67,6 +67,8 @@ class Memory:
         self._vector_disabled = False
         self._embedder_disabled = False
         self._daily_summary_cache: tuple[str, str] | None = None
+        self._semantic_candidate_cache_key: tuple[str, ...] | None = None
+        self._semantic_candidate_cache_embeddings: list[list[float]] | None = None
         self.session_store = SessionStore(self.sessions_dir)
         self._bootstrap_memory_store()
         self.ensure_index_current()
@@ -345,7 +347,7 @@ class Memory:
 
         stored_records = self._upsert_memory_items(
             extracted_items,
-            source_type="conversation_extract",
+            source_type="conversation_extract_v2",
             explicit=False,
         )
         if not stored_records:
@@ -476,31 +478,6 @@ class Memory:
         if not transcript:
             return []
 
-        if brain is not None:
-            extraction_prompt = (
-                "You extract durable user memory from a conversation.\n"
-                "Return strict JSON with one top-level key: items.\n"
-                "items must be a list of objects with keys: tag, text, memory_key, confidence, importance, entities, relations.\n"
-                "tag must be PERSONAL, PROJECT, or FACT.\n"
-                "text must be a short factual memory worth storing.\n"
-                "memory_key must be a stable canonical slot name if the memory can overwrite older conflicting facts.\n"
-                "confidence and importance must be integers 1-10.\n"
-                "entities must be a list of objects with keys name and type.\n"
-                "relations must be a list of objects with keys source, predicate, target.\n"
-                "Only include information that should persist beyond this conversation."
-            )
-            response = brain.chat(
-                messages=[{"role": "user", "content": "\n".join(transcript)}],
-                task_kind="memory",
-                response_format="json",
-                system_override=extraction_prompt,
-            )
-            payload = self._safe_json(response.get("content", ""))
-            if isinstance(payload, dict):
-                structured = self._normalize_extraction_payload(payload)
-                if structured:
-                    return structured
-
         return self._fallback_extract(transcript)
 
     def _normalize_extraction_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -541,26 +518,28 @@ class Memory:
             if not lowered.startswith("USER:"):
                 continue
             content = line[6:].strip()
-            if any(marker in lowered for marker in ("i am ", "my ", "i like ", "remember ")):
+            if not self._looks_like_durable_user_fact(content):
+                continue
+            if any(marker in lowered for marker in ("i am ", "my ", "i like ", "i prefer ", "i want ", "remember ")):
                 items.append(
                     {
                         "tag": "PERSONAL",
                         "text": content,
                         "memory_key": self._default_memory_key("PERSONAL", content),
-                        "confidence": 6,
-                        "importance": 7,
+                        "confidence": 8,
+                        "importance": 8,
                         "entities": self._extract_entities_fallback(content),
                         "relations": [],
                     }
                 )
-            elif any(marker in lowered for marker in ("project", "build", "working on", "jarvis")):
+            elif any(marker in lowered for marker in ("project", "build", "working on", "developing", "making", "jarvis")):
                 items.append(
                     {
                         "tag": "PROJECT",
                         "text": content,
                         "memory_key": self._default_memory_key("PROJECT", content),
-                        "confidence": 6,
-                        "importance": 7,
+                        "confidence": 8,
+                        "importance": 8,
                         "entities": self._extract_entities_fallback(content),
                         "relations": [],
                     }
@@ -586,6 +565,7 @@ class Memory:
         else:
             records = self._sync_external_memory_files(records)
             records = self._apply_memory_decay(records)
+            records = self._sanitize_records(records)
             payload["records"] = records
             payload["updated_at"] = self._now_iso()
             self._save_records_payload(payload)
@@ -784,50 +764,9 @@ class Memory:
         return records
 
     def _legacy_disk_items(self) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        items.extend(
-            {
-                "tag": "PERSONAL",
-                "text": line,
-                "memory_key": self._default_memory_key("PERSONAL", line),
-                "confidence": 9,
-                "importance": 9,
-                "entities": self._extract_entities_fallback(line),
-                "relations": [],
-                "source_type": "manual_file",
-                "source_ref": str(self.profile_path),
-            }
-            for line in self._summary_candidates_from_file(self.profile_path)
-        )
-        items.extend(
-            {
-                "tag": "PROJECT",
-                "text": line,
-                "memory_key": self._default_memory_key("PROJECT", line),
-                "confidence": 9,
-                "importance": 9,
-                "entities": self._extract_entities_fallback(line),
-                "relations": [],
-                "source_type": "manual_file",
-                "source_ref": str(self.projects_path),
-            }
-            for line in self._summary_candidates_from_file(self.projects_path)
-        )
-        for chunk_file in sorted(self.chunks_dir.glob("*.txt")):
-            for item in self._chunk_items_from_file(chunk_file):
-                items.append(
-                    {
-                        **item,
-                        "memory_key": self._default_memory_key(item["tag"], item["text"]),
-                        "confidence": 8,
-                        "importance": 8,
-                        "entities": self._extract_entities_fallback(item["text"]),
-                        "relations": [],
-                        "source_type": "legacy_chunk",
-                        "source_ref": str(chunk_file),
-                    }
-                )
-        return items
+        # profile.md, projects.md, and chunk files are derived artifacts generated from
+        # memory_records.json, so importing them back would re-poison the source of truth.
+        return []
 
     def _upsert_memory_items(
         self,
@@ -847,6 +786,8 @@ class Memory:
             if normalized is None:
                 continue
             if not explicit and normalized["confidence"] < self.settings.memory_confidence_threshold:
+                continue
+            if not explicit and not self._is_safe_auto_memory(normalized["text"], normalized["tag"]):
                 continue
 
             existing_exact = next(
@@ -903,6 +844,24 @@ class Memory:
         self._save_records_payload(payload)
         return accepted_records
 
+    def _sanitize_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for record in records:
+            source_type = str(record.get("source_type", "")).strip().lower()
+            source_ref = str(record.get("source_ref", "")).strip()
+            tag = self._sanitize_tag(record.get("tag"))
+            text = str(record.get("text", "")).strip()
+            if record.get("explicit") and source_ref not in {str(self.profile_path), str(self.projects_path)}:
+                continue
+            if (
+                source_type in {"conversation_extract", "legacy_chunk"}
+                or source_ref in {str(self.profile_path), str(self.projects_path)}
+                or tag == "FACT"
+                or not self._is_safe_auto_memory(text, tag)
+            ):
+                record["active"] = False
+                record["demoted"] = True
+        return records
+
     def _apply_memory_decay(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cutoff = datetime.now().astimezone() - timedelta(days=self.settings.memory_decay_days)
         for record in records:
@@ -948,6 +907,10 @@ class Memory:
             for record in records
             if record.get("active", True) and self._sanitize_tag(record.get("tag")) == "PROJECT"
         ]
+        if not personal_lines:
+            personal_lines = self._trusted_chunk_candidates("PERSONAL")
+        if not project_lines:
+            project_lines = self._trusted_chunk_candidates("PROJECT")
         self._rewrite_summary_file(self.profile_path, "## User Profile", personal_lines)
         self._rewrite_summary_file(self.projects_path, "## Active Projects", project_lines)
 
@@ -1027,6 +990,9 @@ class Memory:
     def _build_daily_context_summary(self, brain: Any | None) -> str:
         profile_lines = self._summary_candidates_from_file(self.profile_path)
         project_lines = self._summary_candidates_from_file(self.projects_path)
+        if not profile_lines and not project_lines:
+            profile_lines = self._trusted_chunk_candidates("PERSONAL")
+            project_lines = self._trusted_chunk_candidates("PROJECT")
         if not profile_lines and not project_lines:
             return ""
 
@@ -1139,6 +1105,186 @@ class Memory:
                 candidates.append(cleaned)
         return candidates
 
+    def _looks_like_durable_user_fact(self, text: str) -> bool:
+        lowered = text.lower().strip()
+        if not lowered or "?" in lowered:
+            return False
+        if any(
+            lowered.startswith(prefix)
+            for prefix in (
+                "open ",
+                "search ",
+                "play ",
+                "list ",
+                "show ",
+                "tell me",
+                "can you",
+                "could you",
+                "please ",
+                "pls ",
+                "what ",
+                "who ",
+                "where ",
+                "when ",
+                "why ",
+                "how ",
+            )
+        ):
+            return False
+        return True
+
+    def _is_safe_auto_memory(self, text: str, tag: str) -> bool:
+        lowered = str(text).strip().lower()
+        if not lowered:
+            return False
+        if any(
+            marker in lowered
+            for marker in (
+                "assistant can ",
+                "jarvis can ",
+                "user asked",
+                "assistant acknowledged",
+                "current session",
+                "session id",
+                "current weather",
+                "weather in ",
+                "current time",
+                "current date",
+                "cpu",
+                "ram",
+                "disk",
+                "battery",
+                "downloads directory",
+                "email was sent",
+                "message id",
+                "bookmarked",
+                "unread notifications",
+                "no scheduled events",
+                "system has ",
+                "user's system",
+                "screenshot",
+                "browser",
+                "http://",
+                "https://",
+            )
+        ):
+            return False
+        if "\\" in lowered and ":" in lowered:
+            return False
+
+        if tag == "PERSONAL":
+            return any(
+                marker in lowered
+                for marker in (
+                    "i am ",
+                    "my ",
+                    "i like ",
+                    "i prefer ",
+                    "i want ",
+                    "name is ",
+                    "my name",
+                    "email",
+                    "@",
+                    "i live",
+                    "live in",
+                    "lives in",
+                    "from ",
+                    "originally from",
+                    "studies at",
+                    "studying in",
+                    "school",
+                    "class ",
+                    "grade ",
+                    "github",
+                    "stud",
+                    "enjoy",
+                    "hate ",
+                    "prefer",
+                    "like ",
+                )
+            )
+        if tag == "PROJECT":
+            return any(
+                marker in lowered
+                for marker in (
+                    "project",
+                    "working on",
+                    "building",
+                    "developing",
+                    "making",
+                    "app",
+                    "website",
+                    "assistant",
+                    "jarvis",
+                    "yantra",
+                )
+            )
+        return False
+
+    def _is_trusted_context_candidate(self, text: str, tag: str) -> bool:
+        lowered = str(text).strip().lower()
+        if not lowered:
+            return False
+        if any(
+            marker in lowered
+            for marker in (
+                "assistant can ",
+                "jarvis can ",
+                "current session",
+                "session id",
+                "current weather",
+                "current time",
+                "current date",
+                "cpu",
+                "ram",
+                "disk",
+                "battery",
+                "downloads directory",
+                "email was sent",
+                "message id",
+                "bookmarked",
+                "unread notifications",
+                "screenshot",
+                "browser",
+                "calendar for ",
+                "system has ",
+                "user asked to open",
+                "samay raina",
+                "india's got latent",
+                "comicstaan",
+                "instagram has",
+                "youtube has",
+                "openai released",
+                "dall-e",
+                "whisper v3",
+                "sora,",
+                "vance to lead",
+                "contest",
+                "article",
+            )
+        ):
+            return False
+        if "\\" in lowered and ":" in lowered and "jarvis" not in lowered and "yantra" not in lowered:
+            return False
+        return self._is_safe_auto_memory(text, tag)
+
+    def _trusted_chunk_candidates(self, tag: str | None = None) -> list[str]:
+        candidates: list[str] = []
+        for chunk_file in sorted(self.chunks_dir.glob("*.txt"), reverse=True):
+            for item in self._chunk_items_from_file(chunk_file):
+                item_tag = self._sanitize_tag(item.get("tag"))
+                text = str(item.get("text", "")).strip()
+                if not text:
+                    continue
+                if tag is not None and item_tag != tag:
+                    continue
+                if item_tag not in {"PERSONAL", "PROJECT"}:
+                    continue
+                if not self._is_trusted_context_candidate(text, item_tag):
+                    continue
+                candidates.append(text)
+        return self._merge_unique(candidates)
+
     def _token_overlap_score(self, query: str, candidate: str) -> float:
         query_tokens = self._normalized_tokens(query)
         candidate_tokens = self._normalized_tokens(candidate)
@@ -1245,13 +1391,8 @@ class Memory:
             text = str(record.get("text", "")).strip()
             if text:
                 candidates.append(text)
-        if include_chunks:
-            for chunk_file in sorted(self.chunks_dir.glob("*.txt"), reverse=True):
-                candidates.extend(
-                    line.strip()
-                    for line in chunk_file.read_text(encoding="utf-8").splitlines()
-                    if line.strip() and not line.startswith("[")
-                )
+        candidates.extend(self._trusted_chunk_candidates("PERSONAL"))
+        candidates.extend(self._trusted_chunk_candidates("PROJECT"))
         return self._merge_unique(candidates)
 
     def _entity_candidates(self, query: str) -> list[str]:
@@ -1503,9 +1644,19 @@ class Memory:
     ) -> tuple[list[str], float]:
         vector_hits = vector_hits or set()
         score_modifiers = score_modifiers or {}
+        semantic_scores = self._semantic_score_candidates(query_variants, candidates)
         scored: list[tuple[float, str]] = []
         for candidate in candidates:
-            best_score = max((self._token_overlap_score(variant, candidate) for variant in query_variants), default=0.0)
+            best_token_score = max((self._token_overlap_score(variant, candidate) for variant in query_variants), default=0.0)
+            best_sequence_score = max(
+                (self._sequence_similarity_score(variant, candidate) for variant in query_variants),
+                default=0.0,
+            )
+            best_phrase_score = max(
+                (self._phrase_overlap_score(variant, candidate) for variant in query_variants),
+                default=0.0,
+            )
+            best_score = best_token_score + (best_sequence_score * 0.2) + best_phrase_score + semantic_scores.get(candidate, 0.0)
             if candidate in vector_hits:
                 best_score += 0.03
             best_score += score_modifiers.get(candidate, 0.0)
@@ -1515,6 +1666,88 @@ class Memory:
         if not scored:
             return [], 0.0
         return self._merge_unique([candidate for _, candidate in scored]), scored[0][0]
+
+    def _semantic_score_candidates(self, query_variants: list[str], candidates: list[str]) -> dict[str, float]:
+        unique_candidates = [candidate for candidate in self._merge_unique(candidates) if candidate]
+        if not unique_candidates:
+            return {}
+        embedder = self._get_embedder()
+        if embedder is None:
+            return {}
+
+        candidate_key = tuple(unique_candidates)
+        candidate_embeddings = self._semantic_candidate_cache_embeddings
+        if self._semantic_candidate_cache_key != candidate_key or candidate_embeddings is None:
+            try:
+                raw_embeddings = embedder.encode(unique_candidates).tolist()
+            except Exception:
+                return {}
+            candidate_embeddings = [self._normalize_embedding(vector) for vector in raw_embeddings]
+            self._semantic_candidate_cache_key = candidate_key
+            self._semantic_candidate_cache_embeddings = candidate_embeddings
+
+        try:
+            query_embeddings_raw = embedder.encode(query_variants).tolist()
+        except Exception:
+            return {}
+        query_embeddings = [self._normalize_embedding(vector) for vector in query_embeddings_raw]
+
+        scores: dict[str, float] = {}
+        for candidate, candidate_embedding in zip(unique_candidates, candidate_embeddings):
+            best_similarity = max(
+                (self._cosine_similarity(query_embedding, candidate_embedding) for query_embedding in query_embeddings),
+                default=0.0,
+            )
+            if best_similarity > 0:
+                scores[candidate] = best_similarity * 0.18
+        return scores
+
+    @staticmethod
+    def _normalize_embedding(vector: list[float]) -> list[float]:
+        magnitude = math.sqrt(sum(float(value) * float(value) for value in vector))
+        if magnitude <= 0:
+            return [0.0 for _ in vector]
+        return [float(value) / magnitude for value in vector]
+
+    @staticmethod
+    def _cosine_similarity(left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        return sum(float(a) * float(b) for a, b in zip(left, right))
+
+    def _sequence_similarity_score(self, query: str, candidate: str) -> float:
+        normalized_query = self._normalize_match_text(query)
+        normalized_candidate = self._normalize_match_text(candidate)
+        if not normalized_query or not normalized_candidate:
+            return 0.0
+        return difflib.SequenceMatcher(None, normalized_query, normalized_candidate).ratio()
+
+    def _phrase_overlap_score(self, query: str, candidate: str) -> float:
+        query_tokens = self._meaningful_query_tokens(query)
+        candidate_tokens = self._meaningful_query_tokens(candidate)
+        if len(query_tokens) < 2 or len(candidate_tokens) < 2:
+            return 0.0
+        candidate_phrases = {
+            f"{first} {second}"
+            for first, second in zip(candidate_tokens, candidate_tokens[1:])
+        }
+        phrase_hits = sum(
+            1
+            for first, second in zip(query_tokens, query_tokens[1:])
+            if f"{first} {second}" in candidate_phrases
+        )
+        return min(phrase_hits * 0.12, 0.24)
+
+    def _meaningful_query_tokens(self, text: str) -> list[str]:
+        return [
+            token
+            for token in re.findall(r"[a-z0-9]+", self._normalize_match_text(text))
+            if token and token not in self._memory_stopwords()
+        ]
+
+    @staticmethod
+    def _normalize_match_text(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value).lower().replace("_", " ")).strip()
 
     def _normalized_tokens(self, text: str) -> set[str]:
         tokens: set[str] = set()

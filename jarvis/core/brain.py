@@ -6,8 +6,6 @@ import json
 import re
 import uuid
 from typing import Any, Callable
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 import requests
 
@@ -19,11 +17,9 @@ class Brain:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or SETTINGS
-        self._prompt_files = (
+        self._base_prompt_files = (
             DATA_AI_DIR / "system_prompt.md",
             DATA_AI_DIR / "behavior_rules.md",
-            DATA_AI_DIR / "tool_guidelines.md",
-            DATA_AI_DIR / "capabilities.md",
         )
         self._prompt_cache_value = ""
         self._prompt_cache_state: tuple[tuple[str, int], ...] = ()
@@ -42,7 +38,7 @@ class Brain:
         system_prompt, compiled_messages = self._compile_messages(
             messages,
             system_override,
-            include_tooling=bool(tools),
+            tool_definitions=tools or [],
         )
 
         heuristic_response = self._offline_tool_response(compiled_messages, tools or [])
@@ -63,6 +59,18 @@ class Brain:
             provider_errors.append(f"nvidia: {exc}")
 
         try:
+            return self._call_groq(
+                system_prompt,
+                compiled_messages,
+                tools or [],
+                task_kind,
+                response_format,
+                stream_handler,
+            )
+        except Exception as exc:  # pragma: no cover - depends on auth/network
+            provider_errors.append(f"groq: {exc}")
+
+        try:
             return self._call_openrouter(
                 system_prompt,
                 compiled_messages,
@@ -76,13 +84,55 @@ class Brain:
 
         return self._offline_response(compiled_messages, tools or [], provider_errors)
 
+    def _call_groq(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        task_kind: str,
+        response_format: str | None,
+        stream_handler: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        api_key = self.settings.groq_api_key.strip()
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY is not set.")
+
+        payload: dict[str, Any] = {
+            "model": self._groq_model_for(task_kind),
+            "messages": self._to_openai_messages(system_prompt, messages),
+            "temperature": 0.2,
+            "max_tokens": 4096,
+        }
+        if tools:
+            payload["tools"] = [
+                {"type": "function", "function": tool_definition}
+                for tool_definition in tools
+            ]
+            payload["tool_choice"] = "auto"
+        if response_format == "json":
+            payload["response_format"] = {"type": "json_object"}
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        return self._call_openai_compatible(
+            url=f"{self.settings.groq_base_url.rstrip('/')}/chat/completions",
+            payload=payload,
+            headers=headers,
+            timeout=self.settings.groq_timeout_seconds,
+            provider="groq",
+            stream_handler=stream_handler,
+        )
+
     def build_system_prompt(self) -> str:
         cache_state = self._prompt_cache_key()
         if cache_state == self._prompt_cache_state and self._prompt_cache_value:
             return self._prompt_cache_value
 
         sections: list[str] = []
-        for prompt_file in self._prompt_files[:2]:
+        for prompt_file in self._base_prompt_files:
             if not prompt_file.exists():
                 continue
             text = prompt_file.read_text(encoding="utf-8").strip()
@@ -96,10 +146,11 @@ class Brain:
         self,
         messages: list[dict[str, Any]],
         system_override: str | None,
-        include_tooling: bool,
+        tool_definitions: list[dict[str, Any]],
     ) -> tuple[str, list[dict[str, Any]]]:
-        include_tooling = include_tooling or any(message.get("role") == "tool" for message in messages)
-        system_parts = [system_override or self.build_system_prompt_for_context(include_tooling)]
+        include_tooling = bool(tool_definitions) or any(message.get("role") == "tool" for message in messages)
+        effective_tools = tool_definitions if include_tooling else []
+        system_parts = [system_override or self.build_system_prompt_for_context(effective_tools)]
         compiled_messages: list[dict[str, Any]] = []
 
         for message in messages:
@@ -115,18 +166,15 @@ class Brain:
         system_prompt = "\n\n".join(part for part in system_parts if part).strip()
         return system_prompt, compiled_messages
 
-    def build_system_prompt_for_context(self, include_tooling: bool) -> str:
-        if not include_tooling:
-            return self.build_system_prompt()
+    def build_system_prompt_for_context(self, tool_definitions: list[dict[str, Any]]) -> str:
+        base_prompt = self.build_system_prompt()
+        if not tool_definitions:
+            return base_prompt
 
-        sections: list[str] = []
-        for prompt_file in self._prompt_files:
-            if not prompt_file.exists():
-                continue
-            text = prompt_file.read_text(encoding="utf-8").strip()
-            if text:
-                sections.append(text)
-        return "\n\n".join(sections).strip()
+        tool_prompt = self._build_tool_prompt(tool_definitions)
+        if not tool_prompt:
+            return base_prompt
+        return f"{base_prompt}\n\n{tool_prompt}".strip()
 
     def _call_nvidia(
         self,
@@ -250,7 +298,7 @@ class Brain:
         stream_handler: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         if stream_handler is not None:
-            streamed = self._post_json_stream(url, payload, headers, timeout, stream_handler)
+            streamed = self._post_json_stream_requests(url, payload, headers, timeout, stream_handler)
             return {
                 "provider": provider,
                 "model": streamed.get("model") or payload["model"],
@@ -259,7 +307,7 @@ class Brain:
                 "raw": streamed.get("raw", {}),
             }
 
-        raw = self._post_json(url, payload, headers, timeout)
+        raw = self._post_json_requests(url, payload, headers, timeout)
         message = raw["choices"][0]["message"]
         tool_calls = [
             {
@@ -345,65 +393,49 @@ class Brain:
                 "raw": {"reason": "offline heuristic"},
             }
 
-        if "reminder_tool" in tool_names:
-            reminder_args = self._parse_reminder_request(last_user_message)
-            if reminder_args is not None:
-                return build_tool_call("reminder_tool", reminder_args)
-        if "calculator_tool" in tool_names:
-            calculator_args = self._parse_calculator_request(last_user_message)
-            if calculator_args is not None:
-                return build_tool_call("calculator_tool", calculator_args)
-        if "system_info_tool" in tool_names:
-            system_action = self._parse_system_info_request(last_user_message)
-            if system_action is not None:
-                return build_tool_call("system_info_tool", {"action": system_action})
-        if "weather_tool" in tool_names:
-            weather_args = self._parse_weather_request(last_user_message)
-            if weather_args is not None:
-                return build_tool_call("weather_tool", weather_args)
-        if "gmail_tool" in tool_names:
-            gmail_args = self._parse_gmail_request(last_user_message)
-            if gmail_args is not None:
-                return build_tool_call("gmail_tool", gmail_args)
-        if "app_launcher_tool" in tool_names:
-            launcher_args = self._parse_app_launcher_request(last_user_message)
-            if launcher_args is not None:
-                return build_tool_call("app_launcher_tool", launcher_args)
-        if "screenshot_tool" in tool_names:
-            screenshot_args = self._parse_screenshot_request(last_user_message)
-            if screenshot_args is not None:
-                return build_tool_call("screenshot_tool", screenshot_args)
-        if "clipboard_tool" in tool_names:
-            clipboard_args = self._parse_clipboard_request(last_user_message)
-            if clipboard_args is not None:
-                return build_tool_call("clipboard_tool", clipboard_args)
-        if "calendar_tool" in tool_names:
-            calendar_args = self._parse_calendar_request(last_user_message)
-            if calendar_args is not None:
-                return build_tool_call("calendar_tool", calendar_args)
-        if "datetime_tool" in tool_names and any(word in message_lower for word in ("time", "date", "day")):
-            return build_tool_call("datetime_tool", {})
-        if "file_manager" in tool_names and any(
-            word in message_lower for word in ("read file", "open file", "save", "write", "find file", "list files")
-        ):
-            return build_tool_call("file_manager", {"action": "list", "path": "."})
-        if "memory_query" in tool_names and any(
-            word in message_lower
-            for word in (
-                "remember",
-                "my",
-                "project",
-                "preference",
-                "who am i",
-                "about me",
-                "know about me",
-                "github username",
-                "school do i",
-                "which class",
-                "grade am i",
-            )
-        ):
-            return build_tool_call("memory_query", {"query": last_user_message, "limit": 5})
+        offline_parsers: dict[str, Any] = {
+            "reminder_tool": self._parse_reminder_request,
+            "calculator_tool": self._parse_calculator_request,
+            "system_info_tool": self._parse_system_info_request,
+            "weather_tool": self._parse_weather_request,
+            "gmail_tool": self._parse_gmail_request,
+            "app_launcher_tool": self._parse_app_launcher_request,
+            "screenshot_tool": self._parse_screenshot_request,
+            "clipboard_tool": self._parse_clipboard_request,
+            "calendar_tool": self._parse_calendar_request,
+            "datetime_tool": lambda message: {} if any(word in message.lower() for word in ("time", "date", "day")) else None,
+            "file_manager": self._parse_file_manager_request,
+            "terminal_tool": self._parse_terminal_request,
+            "memory_query": (
+                lambda message: {"query": message, "limit": 5}
+                if any(
+                    word in message.lower()
+                    for word in (
+                        "remember",
+                        "my",
+                        "project",
+                        "preference",
+                        "who am i",
+                        "about me",
+                        "know about me",
+                        "github username",
+                        "school do i",
+                        "which class",
+                        "grade am i",
+                    )
+                )
+                else None
+            ),
+        }
+
+        for tool_name, parser in offline_parsers.items():
+            if tool_name not in tool_names:
+                continue
+            arguments = parser(last_user_message)
+            if arguments is not None:
+                if isinstance(arguments, str):
+                    arguments = {"action": arguments}
+                return build_tool_call(tool_name, arguments)
         return None
 
     def _to_openai_messages(
@@ -454,6 +486,15 @@ class Brain:
             return self.settings.openrouter_code_model
         return self.settings.openrouter_complex_model
 
+    def _groq_model_for(self, task_kind: str) -> str:
+        if task_kind == "memory":
+            return self.settings.groq_memory_model
+        if task_kind == "simple":
+            return self.settings.groq_simple_model
+        if task_kind == "code":
+            return self.settings.groq_code_model
+        return self.settings.groq_complex_model
+
     def _nvidia_model_for(self, task_kind: str) -> str:
         if task_kind == "memory":
             return self.settings.nvidia_memory_model
@@ -462,95 +503,6 @@ class Brain:
         if task_kind == "code":
             return self.settings.nvidia_code_model
         return self.settings.nvidia_complex_model
-
-    def _post_json(
-        self,
-        url: str,
-        payload: dict[str, Any],
-        headers: dict[str, str],
-        timeout: int,
-    ) -> dict[str, Any]:
-        request = Request(
-            url=url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:  # pragma: no cover - depends on network/provider
-            body = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
-        except URLError as exc:  # pragma: no cover - depends on network/provider
-            raise RuntimeError(str(exc)) from exc
-
-    def _post_json_stream(
-        self,
-        url: str,
-        payload: dict[str, Any],
-        headers: dict[str, str],
-        timeout: int,
-        stream_handler: Callable[[str], None],
-    ) -> dict[str, Any]:
-        streamed_payload = dict(payload)
-        streamed_payload["stream"] = True
-        request = Request(
-            url=url,
-            data=json.dumps(streamed_payload).encode("utf-8"),
-            headers={**headers, "Accept": "text/event-stream"},
-            method="POST",
-        )
-        content_parts: list[str] = []
-        tool_calls_by_index: dict[int, dict[str, Any]] = {}
-        model = streamed_payload.get("model")
-        raw_chunks: list[dict[str, Any]] = []
-
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    raw_chunks.append(chunk)
-                    model = chunk.get("model", model)
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {})
-                    content_delta = delta.get("content")
-                    if isinstance(content_delta, str) and content_delta:
-                        content_parts.append(content_delta)
-                        stream_handler(content_delta)
-                    for tool_delta in delta.get("tool_calls", []) or []:
-                        index = int(tool_delta.get("index", 0) or 0)
-                        entry = tool_calls_by_index.setdefault(
-                            index,
-                            {
-                                "id": "",
-                                "name": "",
-                                "arguments_text": "",
-                            },
-                        )
-                        if tool_delta.get("id"):
-                            entry["id"] = tool_delta["id"]
-                        function_delta = tool_delta.get("function") or {}
-                        if function_delta.get("name"):
-                            entry["name"] = function_delta["name"]
-                        if function_delta.get("arguments"):
-                            entry["arguments_text"] += function_delta["arguments"]
-        except HTTPError as exc:  # pragma: no cover - depends on network/provider
-            body = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
-        except URLError as exc:  # pragma: no cover - depends on network/provider
-            raise RuntimeError(str(exc)) from exc
 
     def _post_json_requests(
         self,
@@ -640,27 +592,6 @@ class Brain:
             raise RuntimeError(f"HTTP {status}: {body}") from exc
         except requests.RequestException as exc:  # pragma: no cover - depends on network/provider
             raise RuntimeError(str(exc)) from exc
-
-        tool_calls = [
-            {
-                "id": tool_call["id"] or f"call_{uuid.uuid4().hex[:8]}",
-                "name": tool_call["name"],
-                "arguments": self._safe_json(tool_call["arguments_text"] or "{}"),
-            }
-            for _, tool_call in sorted(tool_calls_by_index.items())
-            if tool_call["name"]
-        ]
-        content = "".join(content_parts)
-        embedded_tool_calls, cleaned_content = self._extract_embedded_tool_calls(content)
-        if embedded_tool_calls:
-            tool_calls.extend(embedded_tool_calls)
-            content = cleaned_content
-        return {
-            "model": model,
-            "content": content,
-            "tool_calls": tool_calls,
-            "raw": {"chunks": raw_chunks},
-        }
 
         tool_calls = [
             {
@@ -881,8 +812,38 @@ class Brain:
             return {"action": "today", "max_results": 10}
         return None
 
+    def _parse_file_manager_request(self, message: str) -> dict[str, Any] | None:
+        lowered = message.lower()
+        if any(marker in lowered for marker in ("list files", "show files", "show folder", "list folder", "read file", "open file")):
+            return {"action": "list", "path": "."}
+        if any(marker in lowered for marker in ("find file", "search file", "locate file")):
+            return {"action": "find", "path": ".", "pattern": message.strip()}
+        if any(marker in lowered for marker in ("search in files", "find text in files", "grep")):
+            return {"action": "search_text", "path": ".", "query": message.strip()}
+        return None
+
+    def _parse_terminal_request(self, message: str) -> dict[str, Any] | None:
+        lowered = message.lower().strip()
+        if "powershell" in lowered or "command prompt" in lowered or "cmd" in lowered or "terminal" in lowered:
+            quoted = re.search(r"[\"']([^\"']+)[\"']", message)
+            if any(marker in lowered for marker in ("run ", "execute ", "use ", "command")) and quoted:
+                shell = "cmd" if "cmd" in lowered or "command prompt" in lowered else "powershell"
+                return {"action": "run", "shell": shell, "command": quoted.group(1).strip()}
+            if any(marker in lowered for marker in ("help", "what does")):
+                tokens = re.findall(r"[a-zA-Z0-9._-]+", message)
+                topic = tokens[-1] if tokens else ""
+                if topic:
+                    shell = "cmd" if "cmd" in lowered or "command prompt" in lowered else "powershell"
+                    return {"action": "help", "shell": shell, "topic": topic}
+            return {"action": "which", "topic": "powershell"}
+        if any(marker in lowered for marker in ("run command", "execute command")):
+            quoted = re.search(r"[\"']([^\"']+)[\"']", message)
+            if quoted:
+                return {"action": "run", "shell": "powershell", "command": quoted.group(1).strip()}
+        return None
+
     def _summarize_tool_result(self, tool_name: str, payload: Any) -> str:
-        data = payload if isinstance(payload, dict) else {}
+        data = self._unwrap_tool_payload(payload)
         if not isinstance(data, dict):
             return f"{tool_name} result: {self._stringify_content(payload)}"
 
@@ -901,6 +862,9 @@ class Brain:
         if tool_name == "app_launcher_tool":
             resolved = str(data.get("resolved", "")).strip()
             opened = str(data.get("opened", "")).strip() or "the app"
+            target_type = str(data.get("target_type", "")).strip()
+            if target_type == "url":
+                return f"I opened {opened} in your browser."
             if resolved:
                 return f"I opened {opened}."
             return f"I opened {opened}."
@@ -985,16 +949,87 @@ class Brain:
                 battery_text = f", battery {battery}%" if battery is not None else ""
                 return f"System status: CPU {cpu}%, RAM {ram}%, disk {disk}%{battery_text}."
 
+        if tool_name == "file_manager":
+            if data.get("deleted"):
+                return f"I deleted {data.get('path', 'the target path')}."
+            if data.get("moved"):
+                return f"I moved the item to {data.get('destination', 'the destination')}."
+            if data.get("copied"):
+                return f"I copied the item to {data.get('destination', 'the destination')}."
+            if "items" in data:
+                items = data.get("items")
+                if isinstance(items, list):
+                    return f"File listing returned {len(items)} item(s) from {data.get('path', 'the requested path')}."
+            if "matches" in data:
+                matches = data.get("matches")
+                if isinstance(matches, list):
+                    return f"File search returned {len(matches)} match(es)."
+            if "content" in data:
+                summary = str(data.get("summary", "")).strip()
+                if summary:
+                    return summary
+                content = str(data.get("content", "")).strip()
+                if content:
+                    return content[:500]
+
+        if tool_name == "terminal_tool":
+            command = str(data.get("command", "")).strip()
+            exit_code = data.get("exit_code")
+            stdout = str(data.get("stdout", "")).strip()
+            stderr = str(data.get("stderr", "")).strip()
+            if exit_code == 0 and stdout:
+                prefix = f"Command `{command}` succeeded." if command else "Command succeeded."
+                return f"{prefix}\n{stdout[:800]}".strip()
+            if stderr:
+                return stderr[:800]
+
         return f"{tool_name} result: {self._stringify_content(payload)}"
+
+    def _unwrap_tool_payload(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        result = payload.get("result")
+        if isinstance(result, dict):
+            merged = dict(result)
+            merged.setdefault("name", payload.get("name"))
+            if "ok" not in merged:
+                merged["ok"] = payload.get("ok", True)
+            return merged
+        return dict(payload)
 
     def _prompt_cache_key(self) -> tuple[tuple[str, int], ...]:
         state: list[tuple[str, int]] = []
-        for prompt_file in self._prompt_files:
+        for prompt_file in self._base_prompt_files:
             if not prompt_file.exists():
                 continue
             stat = prompt_file.stat()
             state.append((str(prompt_file), stat.st_mtime_ns))
         return tuple(state)
+
+    def _build_tool_prompt(self, tool_definitions: list[dict[str, Any]]) -> str:
+        if not tool_definitions:
+            return ""
+
+        lines = [
+            "## Tools For This Turn",
+            "- Only the attached tool schemas are available right now. Treat those schemas as the source of truth.",
+            "- Prefer one precise tool over broad tool chaining unless a result clearly unlocks the next step.",
+            "- Do not claim tool capabilities that are not present in the attached schemas or confirmed by a real tool result.",
+        ]
+        for tool_definition in tool_definitions:
+            name = str(tool_definition.get("name", "")).strip()
+            description = str(tool_definition.get("description", "")).strip()
+            if not name or not description:
+                continue
+            parameter_keys: list[str] = []
+            parameters = tool_definition.get("parameters", {})
+            if isinstance(parameters, dict):
+                properties = parameters.get("properties", {})
+                if isinstance(properties, dict):
+                    parameter_keys = [str(key).strip() for key in properties.keys() if str(key).strip()][:5]
+            key_fields = f" Key fields: {', '.join(parameter_keys)}." if parameter_keys else ""
+            lines.append(f"- `{name}`: {description}.{key_fields}")
+        return "\n".join(lines)
 
     def _stringify_content(self, content: Any) -> str:
         if content is None:

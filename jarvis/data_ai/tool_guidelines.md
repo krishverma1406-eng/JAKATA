@@ -2,8 +2,8 @@
 |---|---|---|
 | `web_search` | The user asks about news, current events, prices, recent facts, or anything that changes over time | Returns structured citations. Can fetch full page text when needed. Tavily is primary; Brave fallback works only if a Brave key is configured |
 | `datetime_tool` | The user asks for the current time, date, day, timezone conversion, or scheduling context | Use before answering time/date questions |
-| `file_manager` | The user says open, read, save, write, list, find, summarize, inspect PDFs, inspect `.docx`, or check whether files changed | Confirm before overwriting. `watch` is manual polling, not background notifications |
-| `browser_control` | A normal web search is not enough and the task needs opening a browser page or fetching page text | Basic only. No Playwright, no clicking selectors, no login flows, no screenshots |
+| `file_manager` | The user says open, read, save, write, list, find, search inside files, copy, move, delete, create folders, inspect PDFs, inspect `.docx`, or check whether files changed | Prefer this for structured filesystem work. Confirm before overwriting, delete, or replacing an existing destination. `watch` is manual polling, not background notifications |
+| `browser_control` | A task needs a real browser page opened, clicked, typed into, extracted, scrolled, waited on, screenshotted, or evaluated with JavaScript | Uses Amazon Nova Act with a persistent browser session per JARVIS session. Supports deterministic actions like `open`, `click`, `type`, `extract`, `screenshot`, `scroll`, `wait`, `evaluate`, `fill_form`, legacy `fetch`, and prompt-driven `act` tasks |
 | `memory_query` | The user asks personal questions, refers to past conversations, preferences, projects, prior commitments, asks things like "what do you know about me", "who am I", "who is Shaurya", "remember that ...", or "forget what I said about ..." | Use this for memory search, explicit remember, explicit forget, and entity lookups |
 | `reminder_tool` | The user asks to set, list, delete, or check reminders | Stores reminders in `data_user/reminders.json` and due reminders can be surfaced on startup |
 | `clipboard_tool` | The user wants to inspect, copy, replace, or clear clipboard text | Good for summarizing or reusing copied text |
@@ -13,12 +13,13 @@
 | `weather_tool` | The user asks about weather or forecast | Uses OpenWeatherMap and can infer location from memory/profile when available |
 | `gmail_tool` | The user asks to read unread email, search inbox, or send email | Requires Gmail OAuth setup and client secret/token files |
 | `calendar_tool` | The user asks for today's events or to create a calendar event | Requires Google Calendar OAuth setup and client secret/token files |
-| `screenshot_tool` | The user asks to capture the screen or analyze a screenshot | Can capture and can attempt backend vision analysis when supported |
+| `screenshot_tool` | The user asks to capture the screen or analyze a screenshot | Can capture and can attempt backend vision analysis when supported. Useful as the inspection step before downstream desktop actions |
 | `app_launcher_tool` | The user asks to launch a local application by name | Uses local app resolution and OS launch behavior |
 | `session_tool` | The user asks to rename the current session, list recent sessions, inspect the current session, or search discussions from a specific named session | Use this for explicit session management and session search, not for general personal memory |
 | `code_writer` | The user explicitly asks JARVIS to create a new tool, scaffold a feature, or write tool code | Generates code, validates importability, dry-runs `execute()`, and logs success. Do not use silently |
-| `music_player` | The user asks to play or manage local music playback | Uses VLC. Supports local files, folders, fuzzy search, queue/status, volume, and some YouTube URLs via `yt-dlp` |
-| `os_control` | The task needs desktop actions such as screenshots, mouse clicks, typing, scrolling, hotkeys, dragging, or opening local apps | Coordinate-based desktop control only. No vision-guided clicking or UI understanding by itself |
+| `music_player` | The user asks to play or manage local music playback, a local folder, or a direct YouTube URL | Uses VLC. Supports local files, folders, fuzzy search, queue/status, volume, and some YouTube URLs via `yt-dlp`. Do not use this for generic browser YouTube search or browser playback tasks |
+| `os_control` | The task needs desktop actions such as screenshots, mouse clicks, typing, scrolling, hotkeys, dragging, or opening local apps | Coordinate-based desktop control. Pair it with `screenshot_tool` when screen understanding or vision-guided desktop actions are needed |
+| `terminal_tool` | The task needs real command-line access, PowerShell or cmd help, command discovery, shell-based search, or app-launch fallback when higher-level tools are insufficient | Prefer PowerShell for Windows discovery and search. Useful patterns include `Get-Help`, `Get-Command`, `Get-ChildItem`, `Select-String`, and `Start-Process`. Confirm before destructive commands |
 
 For `gmail_tool`, summarize sender, subject, date, and whether action is needed instead of dumping raw message objects unless the user asks for raw details.
 

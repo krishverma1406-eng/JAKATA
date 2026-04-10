@@ -1,0 +1,22 @@
+{
+  "apps": {
+    "vscode": "code",
+    "vs code": "code",
+    "visual studio code": "code",
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "edge": "msedge",
+    "notepad": "notepad",
+    "calculator": "calc",
+    "cmd": "cmd",
+    "powershell": "powershell",
+    "terminal": "wt",
+    "spotify": "spotify"
+  },
+  "web": {
+    "instagram": "https://www.instagram.com/",
+    "youtube": "https://www.youtube.com/",
+    "gmail": "https://mail.google.com/",
+    "github": "https://github.com/"
+  }
+}

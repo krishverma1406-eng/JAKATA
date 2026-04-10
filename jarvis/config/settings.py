@@ -53,6 +53,17 @@ def _parse_bool(value: str | None, default: bool) -> bool:
 @dataclass(frozen=True)
 class Settings:
     user_name: str
+    nova_act_api_key: str
+    nova_act_chrome_channel: str
+    nova_act_headless: bool
+    nova_act_logs_dir: str
+    groq_api_key: str
+    groq_base_url: str
+    groq_simple_model: str
+    groq_memory_model: str
+    groq_complex_model: str
+    groq_code_model: str
+    groq_timeout_seconds: int
     nvidia_api_key: str
     nvidia_base_url: str
     nvidia_simple_model: str
@@ -108,17 +119,31 @@ class Settings:
     gmail_token_file: str
     calendar_client_secret_file: str
     calendar_token_file: str
+    browser_default_timeout_ms: int
+    browser_extract_max_chars: int
 
 
 SETTINGS = Settings(
     user_name=_getenv("JARVIS_USER_NAME", "anime") or "anime",
+    nova_act_api_key=_getenv("NOVA_ACT_API_KEY", "") or "",
+    nova_act_chrome_channel=_getenv("NOVA_ACT_CHROME_CHANNEL", "chrome") or "chrome",
+    nova_act_headless=_parse_bool(_getenv("NOVA_ACT_HEADLESS", "false"), False),
+    nova_act_logs_dir=_getenv("NOVA_ACT_LOGS_DIR", str(DATA_USER_DIR / "nova_act_logs")) or str(DATA_USER_DIR / "nova_act_logs"),
+    groq_api_key=_getenv("GROQ_API_KEY", "") or "",
+    groq_base_url=_getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+    or "https://api.groq.com/openai/v1",
+    groq_simple_model=_getenv("GROQ_SIMPLE_MODEL", "llama-3.1-8b-instant") or "llama-3.1-8b-instant",
+    groq_memory_model=_getenv("GROQ_MEMORY_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile",
+    groq_complex_model=_getenv("GROQ_COMPLEX_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile",
+    groq_code_model=_getenv("GROQ_CODE_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile",
+    groq_timeout_seconds=int(_getenv("GROQ_TIMEOUT_SECONDS", "60") or "60"),
     nvidia_api_key=_getenv("NVIDIA_API_KEY", "") or "",
     nvidia_base_url=_getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     or "https://integrate.api.nvidia.com/v1",
-    nvidia_simple_model=_getenv("NVIDIA_SIMPLE_MODEL", "moonshotai/kimi-k2.5") or "moonshotai/kimi-k2.5",
-    nvidia_memory_model=_getenv("NVIDIA_MEMORY_MODEL", "moonshotai/kimi-k2.5") or "moonshotai/kimi-k2.5",
-    nvidia_complex_model=_getenv("NVIDIA_COMPLEX_MODEL", "moonshotai/kimi-k2.5") or "moonshotai/kimi-k2.5",
-    nvidia_code_model=_getenv("NVIDIA_CODE_MODEL", "moonshotai/kimi-k2.5") or "moonshotai/kimi-k2.5",
+    nvidia_simple_model=_getenv("NVIDIA_SIMPLE_MODEL", "meta/llama-3.3-70b-instruct") or "meta/llama-3.3-70b-instruct",
+    nvidia_memory_model=_getenv("NVIDIA_MEMORY_MODEL", "meta/llama-3.3-70b-instruct") or "meta/llama-3.3-70b-instruct",
+    nvidia_complex_model=_getenv("NVIDIA_COMPLEX_MODEL", "meta/llama-3.3-70b-instruct") or "meta/llama-3.3-70b-instruct",
+    nvidia_code_model=_getenv("NVIDIA_CODE_MODEL", "meta/llama-3.3-70b-instruct") or "meta/llama-3.3-70b-instruct",
     nvidia_timeout_seconds=int(_getenv("NVIDIA_TIMEOUT_SECONDS", "120") or "120"),
     copilot_base_url=_getenv("COPILOT_BASE_URL", "https://api.individual.githubcopilot.com")
     or "https://api.individual.githubcopilot.com",
@@ -201,6 +226,8 @@ SETTINGS = Settings(
         "CALENDAR_TOKEN_FILE",
         str(GOOGLE_TOKEN_DIR / "calendar_token.json"),
     ) or str(GOOGLE_TOKEN_DIR / "calendar_token.json"),
+    browser_default_timeout_ms=int(_getenv("BROWSER_DEFAULT_TIMEOUT_MS", "15000") or "15000"),
+    browser_extract_max_chars=int(_getenv("BROWSER_EXTRACT_MAX_CHARS", "12000") or "12000"),
 )
 
 
@@ -214,6 +241,7 @@ def ensure_directories() -> None:
         USER_VECTOR_DIR,
         USER_NOTES_DIR,
         SCREENSHOTS_DIR,
+        Path(SETTINGS.nova_act_logs_dir),
         GOOGLE_TOKEN_DIR,
         DATA_AI_DIR,
         DATA_USER_DIR,

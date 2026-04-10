@@ -68,6 +68,10 @@ _FALLBACK_HINTS: dict[str, str] = {
         "Calculator tool failed. If the math is simple and safe to do directly, "
         "compute it inline and say that the answer was not tool-verified."
     ),
+    "vision_tool": (
+        "Vision analysis failed. If there is no attached live frame, tell the user to enable the camera panel or send an image. "
+        "If the vision provider failed, report that clearly and do not invent what is visible."
+    ),
 }
 
 
@@ -166,6 +170,7 @@ class Agent:
         user_message: str,
         stream_handler: Callable[[str], None] | None = None,
         event_handler: Callable[[dict[str, Any]], None] | None = None,
+        runtime_context: dict[str, Any] | None = None,
     ) -> str:
         mode_config = self.interface.get_mode(self.mode)
         self.tools.refresh()
@@ -178,6 +183,7 @@ class Agent:
             all_tool_definitions,
             plan,
             memory_context,
+            runtime_context=runtime_context,
         )
 
         if event_handler is not None and mode_config.get("show_debug"):
@@ -303,6 +309,7 @@ class Agent:
                         "session_id": self.session_id,
                         "session_mode": self.mode,
                         "session_name": str(self.session_meta.get("display_name", "")).strip(),
+                        **(runtime_context or {}),
                     },
                 )
                 tool_trace.append(
@@ -670,6 +677,7 @@ class Agent:
         all_tool_definitions: list[dict[str, Any]],
         plan: dict[str, Any],
         memory_context: list[str] | None = None,
+        runtime_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         requested_tools: set[str] = set()
         lowered = user_message.lower().strip()
@@ -684,7 +692,7 @@ class Agent:
             "ok",
             "okay",
         }
-        forced_tools = self._forced_tool_names(user_message, all_tool_definitions)
+        forced_tools = self._forced_tool_names(user_message, all_tool_definitions, runtime_context=runtime_context)
         ranked_tools = ToolRegistry.rank_tool_definitions(user_message, all_tool_definitions)
         top_score = ranked_tools[0][1] if ranked_tools else 0.0
         max_selected = 1 if 0 < top_score <= 1.5 else 4
@@ -710,6 +718,11 @@ class Agent:
         if memory_context and "memory_query" not in forced_tools:
             requested_tools.discard("memory_query")
 
+        if "vision_tool" in forced_tools and not any(
+            marker in lowered for marker in ("browser", "website", "web page", "youtube", "http://", "https://", ".com")
+        ):
+            requested_tools.discard("browser_control")
+
         if "browser_control" in requested_tools and any(
             marker in lowered for marker in ("youtube", "youtu.be", "spotify web", "soundcloud")
         ):
@@ -734,10 +747,12 @@ class Agent:
         self,
         user_message: str,
         all_tool_definitions: list[dict[str, Any]],
+        runtime_context: dict[str, Any] | None = None,
     ) -> set[str]:
         lowered = user_message.lower().strip()
         available = {str(tool_definition["name"]) for tool_definition in all_tool_definitions}
         forced: set[str] = set()
+        has_live_image = bool(isinstance(runtime_context, dict) and str(runtime_context.get("imgbase64", "")).strip())
 
         if any(
             marker in lowered
@@ -845,6 +860,33 @@ class Agent:
         ):
             forced.add("browser_control")
 
+        if has_live_image and any(
+            marker in lowered
+            for marker in (
+                "what is this",
+                "what's this",
+                "what is what i am holding",
+                "what am i holding",
+                "what i'm holding",
+                "what i am holding",
+                "what is in my hand",
+                "what's in my hand",
+                "what do you see",
+                "what can you see",
+                "describe this",
+                "describe what you see",
+                "look at this",
+                "what do i look like",
+                "who is this",
+                "analyze this",
+                "see this",
+                "can you see",
+            )
+        ):
+            forced.add("vision_tool")
+        if has_live_image and ("holding" in lowered or "in my hand" in lowered or "my hand" in lowered):
+            forced.add("vision_tool")
+
         if "browser_control" in forced:
             forced.discard("app_launcher_tool")
             if any(marker in lowered for marker in ("youtube", "youtu.be", "spotify web", "soundcloud")):
@@ -875,6 +917,8 @@ class Agent:
             failed = failures[-1]
             result = failed.get("result", {})
             error = str(result.get("error", "")).strip() or "unknown error"
+            if failed.get("name") == "vision_tool":
+                return f"vision_tool failed: {error}"
             return f"{failed.get('name', 'tool')} failed: {error}"
 
         last = tool_trace[-1]
@@ -899,6 +943,8 @@ class Agent:
                     return f"I found {len(items)} items in {result.get('path', 'that folder')}."
             if tool_name == "browser_control":
                 return "The browser action ran, but I couldn't produce a clean final summary."
+            if tool_name == "vision_tool" and result.get("analysis"):
+                return str(result.get("analysis")).strip()
 
         return "The requested action ran, but I couldn't produce a final summary."
 

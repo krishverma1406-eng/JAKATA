@@ -84,6 +84,8 @@ class Settings:
     openrouter_complex_model: str
     openrouter_code_model: str
     openrouter_timeout_seconds: int
+    gemini_api_key: str
+    gemini_vision_model: str
     stt_enabled: bool
     stt_model: str
     stt_sample_rate: int
@@ -160,6 +162,8 @@ SETTINGS = Settings(
     openrouter_complex_model=_getenv("OPENROUTER_COMPLEX_MODEL", "openrouter/free") or "openrouter/free",
     openrouter_code_model=_getenv("OPENROUTER_CODE_MODEL", "openrouter/free") or "openrouter/free",
     openrouter_timeout_seconds=int(_getenv("OPENROUTER_TIMEOUT_SECONDS", "120") or "120"),
+    gemini_api_key=_getenv("GEMINI_API_KEY", _getenv("GOOGLE_API_KEY", "")) or "",
+    gemini_vision_model=_getenv("GEMINI_VISION_MODEL", "gemini-flash-lite-latest") or "gemini-flash-lite-latest",
     stt_enabled=_parse_bool(
         _getenv("STT_ENABLED", "true"),
         True,

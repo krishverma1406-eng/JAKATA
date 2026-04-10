@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 import threading
@@ -11,7 +10,10 @@ import time
 from dataclasses import replace
 from typing import Any
 
+from rich import box
+from rich.align import Align
 from rich.console import Console
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
@@ -25,6 +27,16 @@ from services.reminders import get_reminder_service
 
 CONSOLE = Console(highlight=False, soft_wrap=True)
 
+ACCENT = "#6EE7F9"
+ACCENT_SOFT = "#8B9CFF"
+SUCCESS = "#59F7A5"
+WARNING = "#F6C177"
+ERROR = "#FF6B8A"
+MUTED = "#7E8AA6"
+SURFACE = "#0E1321"
+SURFACE_ALT = "#141B2E"
+INK = "#EAF2FF"
+
 
 class CliRenderer:
     """Rich terminal rendering for JARVIS."""
@@ -37,20 +49,41 @@ class CliRenderer:
         self.console.print(text)
 
     def error(self, message: str) -> None:
-        self.console.print(Text(f"JARVIS error: {message}", style="bold red"))
+        self.console.print()
+        self.console.print(
+            Panel(
+                Text(message, style=f"bold {ERROR}"),
+                title="[bold]System Fault[/bold]",
+                border_style=ERROR,
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
 
     def info(self, message: str) -> None:
-        self.console.print(Text(message, style="dim"))
+        self.console.print(Text(message, style=MUTED))
 
     def tool(self, message: str) -> None:
-        self.console.print(Text(message, style="yellow"))
+        self.console.print(Text(message, style=WARNING))
 
     def assistant(self, message: str) -> None:
-        sys.stdout.write(f"JARVIS: {message}\n")
-        sys.stdout.flush()
+        self.console.print()
+        self.console.print(
+            Panel(
+                Text(message, style=INK),
+                title=f"[bold {ACCENT}]JARVIS[/bold {ACCENT}]",
+                subtitle=f"[{MUTED}]core response[/]",
+                title_align="left",
+                subtitle_align="right",
+                border_style=ACCENT,
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
 
     def assistant_stream_start(self) -> None:
-        sys.stdout.write("JARVIS: ")
+        self.console.print()
+        sys.stdout.write(f"\033[1;96mJARVIS\033[0m \033[2;37m>\033[0m ")
         sys.stdout.flush()
 
     def assistant_stream_chunk(self, chunk: str) -> None:
@@ -58,38 +91,134 @@ class CliRenderer:
         sys.stdout.flush()
 
     def assistant_stream_end(self) -> None:
-        sys.stdout.write("\n")
+        sys.stdout.write("\n\n")
         sys.stdout.flush()
 
     def user_echo(self, prompt: str) -> None:
-        self.console.print(Text(f"You: {prompt}", style="bold cyan"))
+        bubble = Panel.fit(
+            Text(prompt, style="bold white"),
+            title=f"[bold {ACCENT_SOFT}]You[/bold {ACCENT_SOFT}]",
+            border_style=ACCENT_SOFT,
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+        self.console.print()
+        self.console.print(Align.right(bubble))
 
     def memory_context(self, items: list[str]) -> None:
         if not items:
             return
         body = "\n".join(f"- {item}" for item in items[:5])
-        self.console.print(Panel(body, title="Memory Context", border_style="grey50", style="grey50"))
+        self.console.print(
+            Panel(
+                body,
+                title=f"[bold {ACCENT}]Memory Context[/bold {ACCENT}]",
+                border_style=MUTED,
+                style=MUTED,
+                box=box.ROUNDED,
+            )
+        )
+
+    def splash(self) -> None:
+        title = Text()
+        title.append("J", style=f"bold {ACCENT}")
+        title.append(".A.", style=f"bold {INK}")
+        title.append("R", style=f"bold {ACCENT_SOFT}")
+        title.append(".V.", style=f"bold {INK}")
+        title.append("I", style=f"bold {SUCCESS}")
+        title.append(".S", style=f"bold {ACCENT}")
+        subtitle = Text("Just A Rather Very Intelligent System", style=MUTED)
+        self.console.print()
+        self.console.print(
+            Panel(
+                Align.left(Padding(title + Text("\n") + subtitle, (0, 0, 0, 1))),
+                border_style=ACCENT,
+                box=box.HEAVY,
+                padding=(0, 1),
+                subtitle=f"[{SUCCESS}]online[/]",
+                subtitle_align="right",
+                style=f"on {SURFACE}",
+            )
+        )
 
     def session_banner(self) -> None:
         session_name = str(self.agent.session_meta.get("display_name", "Untitled session")).strip() or "Untitled session"
         mode_config = self.agent.interface.get_mode(self.agent.mode)
         mode_label = str(mode_config.get("label", self.agent.mode)).strip() or self.agent.mode.title()
+        grid = Table.grid(expand=True)
+        grid.add_column(ratio=3)
+        grid.add_column(ratio=2)
+        left = Text()
+        left.append("Session  ", style=MUTED)
+        left.append(session_name, style=f"bold {INK}")
+        left.append("\n")
+        left.append("Mode     ", style=MUTED)
+        left.append(mode_label, style=f"bold {ACCENT}")
+        right = Text()
+        right.append("Engine  ", style=MUTED)
+        right.append("typing", style=f"bold {SUCCESS}")
+        right.append("\n")
+        right.append("State   ", style=MUTED)
+        right.append("ready", style=f"bold {SUCCESS}")
+        grid.add_row(left, Align.right(right))
+        self.console.print()
         self.console.print(
             Panel(
-                Text(f"{session_name}\nMode: {mode_label}", style="white"),
-                title="Session",
-                border_style="blue",
+                grid,
+                title=f"[bold {ACCENT}]Session Deck[/bold {ACCENT}]",
+                border_style=ACCENT_SOFT,
+                box=box.ROUNDED,
+                padding=(0, 1),
+                style=f"on {SURFACE_ALT}",
             )
         )
 
     def briefing(self, text: str) -> None:
-        self.console.print(Panel(Text(text, style="white"), title="Briefing", border_style="cyan"))
+        self.console.print(
+            Panel(
+                Text(text, style=INK),
+                title=f"[bold {ACCENT}]Briefing[/bold {ACCENT}]",
+                border_style=ACCENT,
+                box=box.ROUNDED,
+            )
+        )
+
+    def command_strip(self) -> None:
+        commands = Text()
+        commands.append("/modes", style=f"bold {ACCENT}")
+        commands.append("  ")
+        commands.append("/mode <key>", style=f"bold {ACCENT}")
+        commands.append("  ")
+        commands.append("/name <session>", style=f"bold {ACCENT}")
+        commands.append("  ")
+        commands.append("/session", style=f"bold {ACCENT}")
+        commands.append("  ")
+        commands.append("/sessions [query]", style=f"bold {ACCENT}")
+        commands.append("  ")
+        commands.append("/briefing", style=f"bold {ACCENT}")
+        commands.append("  ")
+        commands.append("/new", style=f"bold {ACCENT}")
+        self.console.print(
+            Panel(
+                commands,
+                title=f"[bold {WARNING}]Command Rail[/bold {WARNING}]",
+                border_style=MUTED,
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
 
     def modes_table(self, modes: list[dict[str, Any]]) -> None:
-        table = Table(title="Available Modes", show_header=True, header_style="bold magenta")
-        table.add_column("Key", style="cyan")
-        table.add_column("Label", style="white")
-        table.add_column("Summary", style="dim")
+        table = Table(
+            title="[bold]Available Modes[/bold]",
+            show_header=True,
+            header_style=f"bold {ACCENT}",
+            box=box.ROUNDED,
+            border_style=ACCENT_SOFT,
+        )
+        table.add_column("Key", style=ACCENT)
+        table.add_column("Label", style=INK)
+        table.add_column("Summary", style=MUTED)
         for mode in modes:
             table.add_row(
                 str(mode.get("key", "")),
@@ -99,10 +228,16 @@ class CliRenderer:
         self.console.print(table)
 
     def sessions_table(self, sessions: list[dict[str, Any]], title: str = "Sessions") -> None:
-        table = Table(title=title, show_header=True, header_style="bold magenta")
-        table.add_column("Name", style="cyan")
-        table.add_column("Mode", style="white")
-        table.add_column("Updated", style="dim")
+        table = Table(
+            title=f"[bold]{title}[/bold]",
+            show_header=True,
+            header_style=f"bold {ACCENT}",
+            box=box.ROUNDED,
+            border_style=ACCENT_SOFT,
+        )
+        table.add_column("Name", style=ACCENT)
+        table.add_column("Mode", style=INK)
+        table.add_column("Updated", style=MUTED)
         table.add_column("Turns", justify="right")
         for session in sessions:
             table.add_row(
@@ -114,7 +249,7 @@ class CliRenderer:
         self.console.print(table)
 
     def input(self) -> str:
-        sys.stdout.write("You: ")
+        sys.stdout.write("\033[1;95mYou\033[0m \033[2;37m>\033[0m ")
         sys.stdout.flush()
         return input()
 
@@ -215,12 +350,14 @@ def main() -> None:
 
 def _run_text_mode(agent: Agent, renderer: CliRenderer) -> None:
     _initialize_reminders(agent, renderer=renderer)
+    renderer.splash()
     renderer.session_banner()
     for startup in agent.startup_messages():
         renderer.briefing(startup)
 
-    renderer.info("JARVIS is ready. Type 'exit' to quit. Modes: typing.")
-    renderer.info("Commands: /modes, /mode <key>, /name <session name>, /session, /sessions [query], /briefing, /new")
+    renderer.console.print(Rule(style=ACCENT_SOFT))
+    renderer.info("JARVIS is ready. Type 'exit' to quit. Interface mode: typing.")
+    renderer.command_strip()
 
     while True:
         try:
@@ -310,6 +447,7 @@ def _run_combined_mode(agent: Agent, renderer: CliRenderer) -> None:
             finally:
                 process_lock.release()
 
+    renderer.splash()
     renderer.session_banner()
     for startup in agent.startup_messages():
         renderer.briefing(startup)
@@ -319,8 +457,9 @@ def _run_combined_mode(agent: Agent, renderer: CliRenderer) -> None:
         feature_notes.append("empty Enter = push-to-talk")
     if agent.settings.wake_word_enabled:
         feature_notes.append("wake word in background")
-    renderer.info(f"JARVIS is ready. Type 'exit' to quit. Modes: {', '.join(feature_notes)}.")
-    renderer.info("Commands: /modes, /mode <key>, /name <session name>, /session, /sessions [query], /briefing, /new")
+    renderer.console.print(Rule(style=ACCENT_SOFT))
+    renderer.info(f"JARVIS is ready. Type 'exit' to quit. Interface modes: {', '.join(feature_notes)}.")
+    renderer.command_strip()
 
     wake_thread: threading.Thread | None = None
     if agent.settings.wake_word_enabled:

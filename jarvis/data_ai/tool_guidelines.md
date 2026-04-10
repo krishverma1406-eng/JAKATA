@@ -6,6 +6,7 @@
 | `datetime_tool` | time, date, day, timezone | none | none |
 | `file_manager` | read, write, list, find, copy, move, delete, PDF, docx | none | terminal_tool |
 | `browser_control` | open website, click, type in browser, extract page | Nova Act API key | web_search |
+| `vision_tool` | what is this, what am i holding, what do you see, describe this image, analyze camera frame | live camera frame or attached image in request, plus Gemini API key | STOP if no image is attached |
 | `memory_query` | remember, who am I, what do you know, forget, my project | none | none |
 | `reminder_tool` | remind me, set reminder, list reminders | none | notes_tool |
 | `clipboard_tool` | clipboard, copy this, paste | none | none |

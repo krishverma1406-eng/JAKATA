@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -79,6 +81,62 @@ def open_app(target: str) -> dict[str, Any]:
     return {"opened": display_name, "resolved": resolved_target, "target_type": target_type}
 
 
+def close_app(target: str, force: bool = False, timeout: float = 2.0) -> dict[str, Any]:
+    identity = _app_identity(target)
+    display_name = str(identity.get("display_name", "")).strip() or str(target).strip() or "the app"
+    processes = _matching_processes(identity)
+    if not processes:
+        return {
+            "target": display_name,
+            "matched": 0,
+            "closed": 0,
+            "remaining": 0,
+            "force": force,
+            "verified_closed": True,
+        }
+
+    closed_pids: set[int] = set()
+    if sys.platform.startswith("win"):
+        for process in processes:
+            if _request_window_close(process.pid):
+                closed_pids.add(process.pid)
+    else:
+        for process in processes:
+            with contextlib.suppress(Exception):
+                process.terminate()
+                closed_pids.add(int(process.pid))
+
+    deadline = time.time() + max(0.2, float(timeout or 0.0))
+    while time.time() < deadline:
+        remaining = _matching_processes(identity)
+        if not remaining:
+            break
+        time.sleep(0.1)
+
+    remaining = _matching_processes(identity)
+    if remaining and force:
+        for process in remaining:
+            with contextlib.suppress(Exception):
+                process.kill()
+                closed_pids.add(int(process.pid))
+        kill_deadline = time.time() + 1.5
+        while time.time() < kill_deadline:
+            remaining = _matching_processes(identity)
+            if not remaining:
+                break
+            time.sleep(0.1)
+
+    remaining = _matching_processes(identity)
+    return {
+        "target": display_name,
+        "matched": len(processes),
+        "closed": max(0, len(processes) - len(remaining)),
+        "remaining": len(remaining),
+        "force": force,
+        "verified_closed": not remaining,
+    }
+
+
 def _load_gui() -> Any:
     try:
         import pyautogui
@@ -88,6 +146,14 @@ def _load_gui() -> Any:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.05
     return pyautogui
+
+
+def _load_psutil() -> Any:
+    try:
+        import psutil
+    except ImportError as exc:  # pragma: no cover - dependency check
+        raise RuntimeError("psutil is not installed.") from exc
+    return psutil
 
 
 def _resolve_app_target(target: str) -> dict[str, str]:
@@ -143,6 +209,90 @@ def _resolve_app_target(target: str) -> dict[str, str]:
     raise RuntimeError(
         f"Couldn't find an installed app or alias for '{cleaned}'. Add one in {APP_ALIASES_FILE.name} if needed."
     )
+
+
+def _app_identity(target: str) -> dict[str, Any]:
+    cleaned = str(target).strip()
+    if not cleaned:
+        raise RuntimeError("App target is required.")
+
+    aliases = _load_app_aliases()
+    executable = aliases.get("apps", {}).get(cleaned.lower(), cleaned)
+    process_names = {
+        _normalize_process_token(cleaned),
+        _normalize_process_token(executable),
+        _normalize_process_token(Path(cleaned).stem),
+        _normalize_process_token(Path(executable).stem),
+    }
+    process_names.discard("")
+
+    resolved_target = executable
+    with contextlib.suppress(RuntimeError):
+        resolved = _resolve_app_target(cleaned)
+        resolved_target = str(resolved.get("resolved", "")).strip() or resolved_target
+        process_names.add(_normalize_process_token(Path(resolved_target).stem))
+
+    return {
+        "display_name": cleaned,
+        "resolved": resolved_target,
+        "process_names": process_names,
+    }
+
+
+def _normalize_process_token(value: str) -> str:
+    token = str(value or "").strip().lower()
+    if token.endswith(".exe"):
+        token = token[:-4]
+    return token
+
+
+def _matching_processes(identity: dict[str, Any]) -> list[Any]:
+    psutil = _load_psutil()
+    wanted = {str(item).strip().lower() for item in identity.get("process_names", set()) if str(item).strip()}
+    if not wanted:
+        return []
+
+    matches: list[Any] = []
+    for process in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            name = _normalize_process_token(str(process.info.get("name", "") or ""))
+            exe = _normalize_process_token(Path(str(process.info.get("exe", "") or "")).stem)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+        if name in wanted or exe in wanted:
+            matches.append(process)
+    return matches
+
+
+def _request_window_close(pid: int) -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return False
+
+    user32 = ctypes.windll.user32
+    WM_CLOSE = 0x0010
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    found = {"sent": False}
+
+    def callback(hwnd: int, _lparam: int) -> bool:
+        window_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+        if int(window_pid.value) != int(pid):
+            return True
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        found["sent"] = True
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(callback), 0)
+    return bool(found["sent"])
 
 
 def _load_app_aliases() -> dict[str, dict[str, str]]:

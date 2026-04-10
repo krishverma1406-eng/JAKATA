@@ -12,7 +12,6 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
@@ -141,79 +140,6 @@ def _normalize_search_results(tool_result: dict[str, Any], arguments: dict[str, 
     }
 
 
-def _vision_reply(prompt: str, imgbase64: str) -> dict[str, Any]:
-    prompt = prompt.strip() or "Describe what is visible in this image."
-    data_uri = f"data:image/jpeg;base64,{imgbase64}"
-    providers = [
-        (
-            "nvidia",
-            SETTINGS.nvidia_api_key.strip(),
-            f"{SETTINGS.nvidia_base_url.rstrip('/')}/chat/completions",
-            SETTINGS.nvidia_complex_model,
-            {"chat_template_kwargs": {"thinking": False}},
-            {
-                "Authorization": f"Bearer {SETTINGS.nvidia_api_key.strip()}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        ),
-        (
-            "openrouter",
-            SETTINGS.openrouter_api_key.strip(),
-            f"{SETTINGS.openrouter_base_url.rstrip('/')}/chat/completions",
-            SETTINGS.openrouter_complex_model,
-            {},
-            {
-                "Authorization": f"Bearer {SETTINGS.openrouter_api_key.strip()}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "HTTP-Referer": "https://github.com/akyourowngames/JAKATA",
-                "X-OpenRouter-Title": "JARVIS",
-            },
-        ),
-    ]
-
-    errors: list[str] = []
-    for provider, api_key, url, model, extra, headers in providers:
-        if not api_key:
-            continue
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                    ],
-                }
-            ],
-            "temperature": 0.2,
-            **extra,
-        }
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=90)
-            response.raise_for_status()
-            raw = response.json()
-        except requests.HTTPError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            code = exc.response.status_code if exc.response is not None else "unknown"
-            errors.append(f"{provider}: HTTP {code}: {body}")
-            continue
-        except requests.RequestException as exc:
-            errors.append(f"{provider}: {exc}")
-            continue
-
-        content = raw.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if isinstance(content, str) and content.strip():
-            return {"ok": True, "provider": provider, "content": content.strip()}
-
-    return {
-        "ok": False,
-        "error": " | ".join(errors) if errors else "No vision-capable provider is configured.",
-    }
-
-
 def _persist_non_tool_turn(agent: Agent, user_message: str, assistant_message: str) -> None:
     agent._remember_turn(user_message, assistant_message)
     agent.memory.persist_conversation(
@@ -299,6 +225,12 @@ def _build_stream(request: ChatRequest) -> Any:
                     if not route_emitted:
                         emit({"activity": {"event": "routing", "route": "realtime"}})
                         route_emitted = True
+                elif tool_name == "vision_tool":
+                    current_route = "vision"
+                    emit({"activity": {"event": "vision_analyzing", "message": "Analyzing live camera frame..."}})
+                    if not route_emitted:
+                        emit({"activity": {"event": "routing", "route": "vision"}})
+                        route_emitted = True
                 else:
                     emit(
                         {
@@ -345,29 +277,11 @@ def _build_stream(request: ChatRequest) -> Any:
                     emit({"startup_message": startup_message, "session": _session_payload(agent)})
                 emit({"activity": {"event": "query_detected", "message": message}})
 
-                if request.imgbase64:
-                    emit({"activity": {"event": "routing", "route": "vision"}})
-                    emit({"activity": {"event": "vision_analyzing", "message": "Analyzing image..."}})
-                    vision = _vision_reply(message, request.imgbase64)
-                    if not vision.get("ok"):
-                        emit({"error": str(vision.get("error", "Vision analysis failed.")), "done": True, "session_id": session_id})
-                        return
-                    response_text = str(vision.get("content", "")).strip() or "No response generated."
-                    emit({"activity": {"event": "streaming_started", "route": "vision"}})
-                    emit({"activity": {"event": "first_chunk", "route": "vision", "elapsed_ms": int((time.perf_counter() - started_at) * 1000)}})
-                    emit({"chunk": response_text})
-                    if request.tts:
-                        try:
-                            audio = synthesize_base64_sync(response_text, agent.settings)
-                        except Exception:
-                            audio = None
-                        if audio:
-                            emit({"audio": audio})
-                    _persist_non_tool_turn(agent, message, response_text)
-                    emit({"done": True, "session_id": session_id, "session": _session_payload(agent)})
-                    return
-
-                response_text = agent.run(message, event_handler=event_handler)
+                response_text = agent.run(
+                    message,
+                    event_handler=event_handler,
+                    runtime_context={"imgbase64": request.imgbase64 or ""},
+                )
                 if not streamed_any and response_text:
                     if not route_emitted:
                         emit({"activity": {"event": "routing", "route": current_route}})

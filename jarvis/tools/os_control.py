@@ -15,7 +15,7 @@ TOOL_DEFINITION = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["screenshot", "click", "type", "scroll", "hotkey", "drag", "open_app"],
+                "enum": ["screenshot", "click", "type", "scroll", "hotkey", "drag", "open_app", "close_app"],
                 "description": "Desktop action to perform.",
             },
             "x": {"type": "integer"},
@@ -28,6 +28,7 @@ TOOL_DEFINITION = {
             "amount": {"type": "integer"},
             "keys": {"type": "array", "items": {"type": "string"}},
             "target": {"type": "string"},
+            "force": {"type": "boolean"},
             "duration": {"type": "number"},
         },
         "required": ["action"],
@@ -72,4 +73,19 @@ def execute(params: dict[str, Any]) -> dict[str, Any]:
         if not target:
             return {"ok": False, "error": "target is required for open_app action."}
         return {"ok": True, **desktop.open_app(target)}
+    if action == "close_app":
+        target = str(params.get("target", "")).strip()
+        if not target:
+            return {"ok": False, "error": "target is required for close_app action."}
+        result = desktop.close_app(target, force=bool(params.get("force", False)))
+        if result.get("verified_closed") is False:
+            return {
+                "ok": False,
+                **result,
+                "error": (
+                    f"{result.get('target', target)} is still running "
+                    f"({result.get('remaining', 0)} process(es) remain)."
+                ),
+            }
+        return {"ok": True, **result}
     return {"ok": False, "error": f"Unsupported action: {action}"}

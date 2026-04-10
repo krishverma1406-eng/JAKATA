@@ -83,16 +83,21 @@ class CliRenderer:
 
     def assistant_stream_start(self) -> None:
         self.console.print()
-        sys.stdout.write(f"\033[1;96mJARVIS\033[0m \033[2;37m>\033[0m ")
-        sys.stdout.flush()
+        self.console.print(
+            Text.assemble(
+                ("JARVIS", f"bold {ACCENT}"),
+                (" > ", MUTED),
+            ),
+            end="",
+            soft_wrap=True,
+        )
 
     def assistant_stream_chunk(self, chunk: str) -> None:
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
+        self.console.print(Text(chunk, style=INK), end="", soft_wrap=True, highlight=False)
 
     def assistant_stream_end(self) -> None:
-        sys.stdout.write("\n\n")
-        sys.stdout.flush()
+        self.console.print()
+        self.console.print()
 
     def user_echo(self, prompt: str) -> None:
         bubble = Panel.fit(
@@ -249,8 +254,14 @@ class CliRenderer:
         self.console.print(table)
 
     def input(self) -> str:
-        sys.stdout.write("\033[1;95mYou\033[0m \033[2;37m>\033[0m ")
-        sys.stdout.flush()
+        self.console.print(
+            Text.assemble(
+                ("You", f"bold {ACCENT_SOFT}"),
+                (" > ", MUTED),
+            ),
+            end="",
+            soft_wrap=True,
+        )
         return input()
 
 

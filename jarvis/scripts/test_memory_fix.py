@@ -20,13 +20,13 @@ def test_no_chunk_reads():
     
     # This should only read from records, not chunks
     candidates = mem._candidate_pool(include_facts=True)
-    print(f"✓ _candidate_pool returned {len(candidates)} candidates from records only")
+    print(f"[OK] _candidate_pool returned {len(candidates)} candidates from records only")
     
     # Verify _trusted_chunk_candidates is not called in recall path
     import inspect
     recall_source = inspect.getsource(mem.recall)
     assert "_trusted_chunk_candidates" not in recall_source, "recall() still calls _trusted_chunk_candidates!"
-    print("✓ recall() does not call _trusted_chunk_candidates")
+    print("[OK] recall() does not call _trusted_chunk_candidates")
 
 
 def test_incremental_indexing():
@@ -38,7 +38,7 @@ def test_incremental_indexing():
     assert "_reset_collection" not in index_source, "ensure_index_current still calls _reset_collection!"
     assert "existing_ids" in index_source, "ensure_index_current missing incremental logic!"
     assert "new_items" in index_source, "ensure_index_current missing incremental logic!"
-    print("✓ ensure_index_current uses incremental updates")
+    print("[OK] ensure_index_current uses incremental updates")
 
 
 def test_no_chunk_writes():
@@ -48,25 +48,18 @@ def test_no_chunk_writes():
     import inspect
     persist_source = inspect.getsource(mem._persist_extracted_memory)
     assert "_append_chunk" not in persist_source, "_persist_extracted_memory still writes chunks!"
-    print("✓ _persist_extracted_memory does not write chunk files")
+    print("[OK] _persist_extracted_memory does not write chunk files")
 
 
 def test_memory_source_state():
-    """Verify _memory_source_state only watches records and entities."""
+    """Verify _memory_source_state returns the new digest-based shape."""
     mem = Memory()
     
     state = mem._memory_source_state()
-    paths = [f["path"] for f in state.get("files", [])]
-    
-    # Should only have records and entities
-    assert any("memory_records.json" in p for p in paths), "records not in state!"
-    assert any("entities.json" in p for p in paths), "entities not in state!"
-    
-    # Should NOT have chunks, profile, or projects
-    assert not any("chunks" in p and p.endswith(".txt") for p in paths), "chunk files still in state!"
-    assert not any("profile.md" in p for p in paths), "profile.md still in state!"
-    assert not any("projects.md" in p for p in paths), "projects.md still in state!"
-    print("✓ _memory_source_state only watches records and entities")
+    assert "records_digest" in state, "records_digest missing from state!"
+    assert "count" in state, "count missing from state!"
+    assert "files" not in state, "legacy files key should not be present!"
+    print("[OK] _memory_source_state uses digest-based state")
 
 
 def test_query_embedding_cache():
@@ -76,13 +69,13 @@ def test_query_embedding_cache():
     # Should be initialized in __init__
     assert hasattr(mem, "_query_embedding_cache"), "_query_embedding_cache not initialized!"
     assert isinstance(mem._query_embedding_cache, dict), "_query_embedding_cache wrong type!"
-    print("✓ _query_embedding_cache properly initialized")
+    print("[OK] _query_embedding_cache properly initialized")
     
     # Should be cleared in _rebuild_materialized_memory
     import inspect
     rebuild_source = inspect.getsource(mem._rebuild_materialized_memory)
     assert "_query_embedding_cache = {}" in rebuild_source, "_query_embedding_cache not cleared on rebuild!"
-    print("✓ _query_embedding_cache cleared on memory rebuild")
+    print("[OK] _query_embedding_cache cleared on memory rebuild")
 
 
 def test_conflict_detection():
@@ -94,7 +87,7 @@ def test_conflict_detection():
     
     # Should NOT have tag restriction
     assert 'if tag not in {' not in conflict_source, "_find_conflicting_record still has tag restriction!"
-    print("✓ _find_conflicting_record works for all tags")
+    print("[OK] _find_conflicting_record works for all tags")
 
 
 def test_fallback_extract_dedup():
@@ -105,7 +98,7 @@ def test_fallback_extract_dedup():
     fallback_source = inspect.getsource(mem._fallback_extract)
     assert "existing_texts" in fallback_source, "_fallback_extract missing dedup check!"
     assert "content.lower() in existing_texts" in fallback_source, "_fallback_extract dedup check wrong!"
-    print("✓ _fallback_extract has proper deduplication")
+    print("[OK] _fallback_extract has proper deduplication")
 
 
 def test_daily_summary_no_chunks():
@@ -116,7 +109,7 @@ def test_daily_summary_no_chunks():
     summary_source = inspect.getsource(mem._build_daily_context_summary)
     assert "_trusted_chunk_candidates" not in summary_source, "_build_daily_context_summary still uses chunks!"
     assert "_load_records_payload" in summary_source, "_build_daily_context_summary missing records fallback!"
-    print("✓ _build_daily_context_summary uses records, not chunks")
+    print("[OK] _build_daily_context_summary uses records, not chunks")
 
 
 def main():
@@ -132,13 +125,13 @@ def main():
         test_fallback_extract_dedup()
         test_daily_summary_no_chunks()
         
-        print("\n✅ All tests passed! Memory fixes are correctly implemented.")
+        print("\n[PASS] All tests passed! Memory fixes are correctly implemented.")
         return 0
     except AssertionError as e:
-        print(f"\n❌ Test failed: {e}")
+        print(f"\n[FAIL] Test failed: {e}")
         return 1
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+        print(f"\n[FAIL] Unexpected error: {e}")
         import traceback
         traceback.print_exc()
         return 1

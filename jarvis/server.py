@@ -62,6 +62,7 @@ class SessionModeRequest(BaseModel):
     mode: str = Field(..., min_length=1, max_length=40)
 
 
+MAX_SESSIONS = 50
 _SESSIONS: dict[str, Agent] = {}
 _SESSIONS_LOCK = threading.Lock()
 _TASKS: dict[str, dict[str, Any]] = {}
@@ -97,6 +98,9 @@ def _get_agent(session_id: str | None, mode: str | None = None) -> tuple[str, Ag
         sid = (session_id or "").strip() or uuid.uuid4().hex[:12]
         agent = _SESSIONS.get(sid)
         if agent is None:
+            if len(_SESSIONS) >= MAX_SESSIONS:
+                oldest_sid = next(iter(_SESSIONS))
+                _SESSIONS.pop(oldest_sid, None)
             session_settings = replace(SETTINGS, tts_enabled=True)
             agent = Agent(settings=session_settings)
             agent.bind_session(sid, mode=mode)

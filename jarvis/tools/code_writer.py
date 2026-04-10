@@ -14,7 +14,7 @@ MAX_RETRIES = 3
 
 TOOL_DEFINITION = {
     "name": "code_writer",
-    "description": "Generate or repair a tool file, validate it, dry-run it, and log the result.",
+    "description": "Generate or repair a JARVIS tool file, validate it, dry-run it, and log the result. Use only when the user explicitly asks to create, scaffold, or fix a tool file, not for ordinary code snippets or coding answers.",
     "parameters": {
         "type": "object",
         "properties": {

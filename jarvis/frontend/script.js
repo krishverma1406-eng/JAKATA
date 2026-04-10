@@ -822,7 +822,7 @@ async function sendMessageWithImage(text, imgBase64) {
                         fullResponse += chunkText;
                         const textSpan = contentEl.querySelector('.msg-stream-text');
                         if (textSpan) {
-                            textSpan.textContent = fullResponse;
+                            renderMessageContent(textSpan, fullResponse);
                             textSpan.classList.remove('stream-placeholder');
                         }
                         if (!cursorEl) {
@@ -1286,6 +1286,33 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
+function enhanceRenderedMessage(el) {
+    if (!el) return;
+    el.querySelectorAll('pre code').forEach(block => {
+        block.style.display = 'block';
+        block.style.padding = '12px';
+        block.style.background = 'rgba(0,0,0,0.3)';
+        block.style.borderRadius = '8px';
+        block.style.overflow = 'auto';
+        block.style.fontSize = '0.82rem';
+    });
+    el.querySelectorAll('a').forEach(link => {
+        link.setAttribute('target', '_blank');
+        link.setAttribute('rel', 'noopener noreferrer');
+    });
+}
+
+function renderMessageContent(el, text) {
+    if (!el) return;
+    const safeText = typeof text === 'string' ? text : String(text || '');
+    if (typeof marked !== 'undefined') {
+        el.innerHTML = marked.parse(safeText, { breaks: true, gfm: true });
+        enhanceRenderedMessage(el);
+    } else {
+        el.textContent = safeText;
+    }
+}
+
 function hideWelcome() {
     const w = document.getElementById('welcome-screen');
     if (w) w.remove();
@@ -1310,9 +1337,24 @@ function addMessage(role, text) {
         : 'You';
     const content = document.createElement('div');
     content.className = 'msg-content';
-    content.textContent = text;
+    if (text && typeof marked !== 'undefined') {
+        renderMessageContent(content, text);
+    } else {
+        content.textContent = text;
+    }
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-copy-btn';
+    copyBtn.title = 'Copy message';
+    copyBtn.setAttribute('type', 'button');
+    copyBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span>Copy</span>';
+    copyBtn.addEventListener('click', () => {
+        navigator.clipboard.writeText(content.textContent || content.innerText || '')
+            .then(() => showToast('Copied!'))
+            .catch(() => showToast('Copy failed.'));
+    });
     body.appendChild(label);
     body.appendChild(content);
+    body.appendChild(copyBtn);
     msg.appendChild(avatar);
     msg.appendChild(body);
     chatMessages.appendChild(msg);
@@ -1477,7 +1519,7 @@ async function sendMessage(textOverride) {
                         fullResponse += chunkText;
                         const textSpan = contentEl.querySelector('.msg-stream-text');
                         if (textSpan) {
-                            textSpan.textContent = fullResponse;
+                            renderMessageContent(textSpan, fullResponse);
                             textSpan.classList.remove('stream-placeholder');
                         }
                         if (!cursorEl) {

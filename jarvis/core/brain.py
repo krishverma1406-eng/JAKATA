@@ -189,14 +189,16 @@ class Brain:
         if not api_key:
             raise RuntimeError("NVIDIA_API_KEY is not set.")
 
+        model_name = self._nvidia_model_for(task_kind)
         payload: dict[str, Any] = {
-            "model": self._nvidia_model_for(task_kind),
+            "model": model_name,
             "messages": self._to_openai_messages(system_prompt, messages),
             "temperature": 0.6,
             "top_p": 0.95,
             "max_tokens": 4096,
-            "chat_template_kwargs": {"thinking": False},
         }
+        if any(name in model_name.lower() for name in ("kimi", "qwen", "deepseek")):
+            payload["chat_template_kwargs"] = {"thinking": False}
         if tools:
             payload["tools"] = [
                 {"type": "function", "function": tool_definition}

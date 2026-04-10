@@ -345,7 +345,7 @@ class Memory:
         self._append_session_turns(session_id, user_message, assistant_message, tool_trace, turn_meta=turn_meta)
 
         if not should_extract:
-            return {"stored": 0, "chunks": []}
+            return {"stored": 0, "items": []}
 
         if background:
             threading.Thread(
@@ -353,7 +353,7 @@ class Memory:
                 args=(conversation, brain),
                 daemon=True,
             ).start()
-            return {"stored": 0, "chunks": []}
+            return {"stored": 0, "items": []}
 
         return self._persist_extracted_memory(conversation, brain)
 
@@ -364,7 +364,7 @@ class Memory:
     ) -> dict[str, Any]:
         extracted_items = self._extract_memories(conversation, brain)
         if not extracted_items:
-            return {"stored": 0, "chunks": []}
+            return {"stored": 0, "items": []}
 
         stored_records = self._upsert_memory_items(
             extracted_items,
@@ -372,13 +372,16 @@ class Memory:
             explicit=False,
         )
         if not stored_records:
-            return {"stored": 0, "chunks": []}
+            return {"stored": 0, "items": []}
 
         # Do NOT write chunk files — records are the source of truth.
         # Chunk files are legacy write-logs that cause stale data in recall and
         # trigger unnecessary re-indexing via _memory_source_state.
         self._rebuild_materialized_memory(stored_records_changed=True)
-        return {"stored": len(stored_records), "chunks": []}
+        return {
+            "stored": len(stored_records),
+            "items": [str(record.get("text", "")).strip() for record in stored_records if str(record.get("text", "")).strip()],
+        }
 
     def load_recent_messages(self, limit_messages: int = 12) -> list[dict[str, str]]:
         collected: list[dict[str, str]] = []

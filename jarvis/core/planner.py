@@ -271,20 +271,42 @@ class Planner:
         }]
 
     def _guess_tools(self, fragment: str, tool_definitions: list[dict[str, Any]]) -> list[str]:
+        if self._explicit_code_writer_request(fragment):
+            allowed = {tool["name"] for tool in tool_definitions}
+            return ["code_writer"] if "code_writer" in allowed else []
         ranked = ToolRegistry.rank_tool_definitions(fragment, tool_definitions)
+        ranked = [(tool_definition, score) for tool_definition, score in ranked if tool_definition["name"] != "code_writer"]
         if not ranked:
             return []
         top_score = ranked[0][1]
+        score_floor = max(1.0, top_score * 0.35)
+        budget = 6 if len(str(fragment or "").split()) >= 8 else 4
         selected: list[str] = []
         for tool_definition, score in ranked:
-            if score < 1.5:
+            if score < score_floor:
                 break
-            if top_score > 0 and score < max(1.5, top_score * 0.6):
-                continue
             selected.append(str(tool_definition["name"]))
-            if len(selected) >= 3:
+            if len(selected) >= budget:
                 break
         return selected
+
+    def _explicit_code_writer_request(self, fragment: str) -> bool:
+        lowered = str(fragment or "").lower().strip()
+        explicit_markers = (
+            "create a tool",
+            "build a tool",
+            "new jarvis tool",
+            "make a tool",
+            "write tool code",
+            "generate tool code",
+            "scaffold a tool",
+            "repair tool file",
+            "fix tool file",
+            "code_writer",
+            "tool file",
+            "tool module",
+        )
+        return any(marker in lowered for marker in explicit_markers)
 
     def _likely_tool_names(
         self,

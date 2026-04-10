@@ -36,9 +36,9 @@ def test_recall_speed():
             print(f"  {i}. {result[:80]}")
         
         if elapsed > 5.0:
-            print(f"  ⚠️  WARNING: Slow recall ({elapsed:.1f}s)")
+            print(f"  [WARN] Slow recall ({elapsed:.1f}s)")
         else:
-            print(f"  ✓ Fast recall")
+            print("  [OK] Fast recall")
 
 
 def test_no_chunk_reads():
@@ -47,40 +47,33 @@ def test_no_chunk_reads():
     memory = Memory(SETTINGS)
     
     # Get candidates
-    candidates = memory._candidate_pool(include_chunks=False)
+    candidates = memory._candidate_pool(include_facts=False)
     print(f"Total candidates: {len(candidates)}")
     
     # Check if any candidates came from chunks
     # (This is indirect - we just verify we get reasonable results)
     if len(candidates) > 0:
-        print("✓ Candidates retrieved from records")
+        print("[OK] Candidates retrieved from records")
         print(f"Sample: {candidates[0][:80] if candidates else 'None'}")
     else:
-        print("⚠️  No candidates found")
+        print("[WARN] No candidates found")
 
 
 def test_conflict_detection():
     """Test that conflicting records are detected and superseded."""
     print("\n=== Test 3: Conflict Detection ===")
     memory = Memory(SETTINGS)
-    
-    # Try to add a conflicting fact
-    print("\nAdding: 'Krish loves meetings on Mondays'")
-    result = memory.remember("Krish loves meetings on Mondays", brain=None, source="test")
-    
-    print(f"Stored: {result.get('stored', 0)} items")
-    print(f"Items: {result.get('items', [])}")
-    
-    # Check what we recall now
-    recall_results = memory.recall("Krish meetings Monday", limit=3)
-    print(f"\nRecall results for 'Krish meetings Monday':")
-    for i, r in enumerate(recall_results, 1):
-        print(f"  {i}. {r}")
-    
-    if len(recall_results) > 0:
-        print("✓ Conflict handling working")
+
+    import inspect
+
+    upsert_source = inspect.getsource(memory._upsert_memory_items)
+    conflict_source = inspect.getsource(memory._find_conflicting_record)
+
+    print("Inspecting _upsert_memory_items and _find_conflicting_record...")
+    if "_find_conflicting_record" in upsert_source and "superseded_by" in upsert_source and "demoted" in conflict_source:
+        print("[OK] Conflict handling hooks are present without mutating real memory")
     else:
-        print("⚠️  No results found")
+        print("[WARN] Conflict handling hooks look incomplete")
 
 
 def test_incremental_indexing():
@@ -104,9 +97,9 @@ def test_incremental_indexing():
     print(f"Second index (no changes): {elapsed:.3f}s")
     
     if elapsed < 0.5:
-        print("✓ Incremental indexing working (instant when no changes)")
+        print("[OK] Incremental indexing working (instant when no changes)")
     else:
-        print(f"⚠️  Slow re-index ({elapsed:.1f}s)")
+        print(f"[WARN] Slow re-index ({elapsed:.1f}s)")
 
 
 def test_background_indexing():
@@ -122,14 +115,14 @@ def test_background_indexing():
     print(f"Memory init time: {elapsed:.3f}s")
     
     if elapsed < 1.0:
-        print("✓ Memory init is fast (indexing in background)")
+        print("[OK] Memory init is fast (indexing in background)")
     else:
-        print(f"⚠️  Slow init ({elapsed:.1f}s) - may be blocking")
+        print(f"[WARN] Slow init ({elapsed:.1f}s) - may be blocking")
     
     # Give background thread time to complete
     print("Waiting for background indexing...")
     time.sleep(2)
-    print("✓ Background indexing complete")
+    print("[OK] Background indexing complete")
 
 
 def test_dedup_extraction():
@@ -152,9 +145,9 @@ def test_dedup_extraction():
     print(f"Extracted items: {len(items)}")
     
     if len(items) == 0:
-        print("✓ Dedup working - existing fact not re-extracted")
+        print("[OK] Dedup working - existing fact not re-extracted")
     else:
-        print(f"⚠️  Extracted {len(items)} items (may be duplicate)")
+        print(f"[WARN] Extracted {len(items)} items (may be duplicate)")
         for item in items:
             print(f"  - {item.get('text', '')}")
 
@@ -215,7 +208,7 @@ def main():
         print("=" * 60)
         
     except Exception as e:
-        print(f"\n❌ Test failed with error: {e}")
+        print(f"\n[FAIL] Test failed with error: {e}")
         import traceback
         traceback.print_exc()
 

@@ -66,13 +66,21 @@ class ToolRegistry:
         self.refresh()
         return name in self._executors
 
-    def run_tool(self, name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def run_tool(
+        self,
+        name: str,
+        params: dict[str, Any] | None = None,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.refresh()
         if name not in self._executors:
             return {"ok": False, "name": name, "error": f"Tool '{name}' is not registered."}
 
         try:
-            result = self._executors[name](params or {})
+            payload = dict(params or {})
+            if runtime_context:
+                payload["_runtime_context"] = dict(runtime_context)
+            result = self._executors[name](payload)
             return {"ok": True, "name": name, "result": result}
         except Exception as exc:
             return {"ok": False, "name": name, "error": str(exc)}

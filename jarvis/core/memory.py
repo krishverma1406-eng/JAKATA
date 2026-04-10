@@ -28,6 +28,7 @@ from config.settings import (
     USER_VECTOR_DIR,
     Settings,
 )
+from core.session_store import SessionStore
 
 
 class Memory:
@@ -66,6 +67,7 @@ class Memory:
         self._vector_disabled = False
         self._embedder_disabled = False
         self._daily_summary_cache: tuple[str, str] | None = None
+        self.session_store = SessionStore(self.sessions_dir)
         self._bootstrap_memory_store()
         self.ensure_index_current()
 
@@ -142,6 +144,57 @@ class Memory:
         selected = [entity for _, entity in scored[: (limit or self.settings.memory_top_k)]]
         return {"ok": True, "entities": selected}
 
+    def session_search(self, query: str, limit: int | None = None) -> dict[str, Any]:
+        cleaned = str(query).strip()
+        if not cleaned:
+            return {"ok": False, "sessions": [], "error": "No session query provided."}
+        sessions = self.session_store.search_sessions(cleaned, limit or self.settings.memory_top_k)
+        return {"ok": True, "query": cleaned, "sessions": sessions}
+
+    def ensure_session(
+        self,
+        session_id: str,
+        preferred_name: str | None = None,
+        mode: str = "normal",
+    ) -> dict[str, Any]:
+        return self.session_store.ensure_session(session_id, preferred_name=preferred_name, mode=mode)
+
+    def rename_session(self, session_id: str, new_name: str) -> dict[str, Any]:
+        return self.session_store.rename_session(session_id, new_name)
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        return self.session_store.get_session(session_id)
+
+    def list_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self.session_store.list_sessions(limit=limit)
+
+    def set_session_mode(self, session_id: str, mode: str) -> dict[str, Any]:
+        return self.session_store.set_mode(session_id, mode)
+
+    def active_project_items(self, limit: int = 5) -> list[str]:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            return []
+        seen: set[str] = set()
+        items: list[str] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("tag", "")).strip().upper() != "PROJECT":
+                continue
+            if not record.get("active", True):
+                continue
+            text = str(record.get("text", "")).strip()
+            normalized = text.lower()
+            if not text or normalized in seen:
+                continue
+            seen.add(normalized)
+            items.append(text)
+            if len(items) >= max(1, limit):
+                break
+        return items
+
     def get_daily_context_summary(self, brain: Any | None = None) -> str:
         today = datetime.now().date().isoformat()
         if self._daily_summary_cache and self._daily_summary_cache[0] == today:
@@ -181,6 +234,7 @@ class Memory:
             records = []
         active_records = [record for record in records if record.get("active", True)]
         entity_candidates = self._entity_candidates(query)
+        session_candidates = self._session_candidates(query, limit * 2)
         record_modifiers = self._record_text_modifiers(active_records)
         recent_candidates = self._merge_unique(
             self._recent_session_candidates(),
@@ -197,13 +251,14 @@ class Memory:
                     self._merge_unique(
                         self._candidate_pool(include_chunks=True),
                         entity_candidates,
+                        session_candidates,
                     ),
                     score_modifiers=record_modifiers,
                 )
                 return self._merge_unique(recent_ranked, supplemental_ranked)[:limit]
 
         if any(marker in lowered for marker in ("know about me", "remember about me", "who am i", "my profile")):
-            profile_items = self._merge_unique(self._candidate_pool(include_chunks=False), entity_candidates)
+            profile_items = self._merge_unique(self._candidate_pool(include_chunks=False), entity_candidates, session_candidates)
             vector_hit_records = self._merge_unique_records(
                 *[self._query_vector_store(variant, limit * 2) for variant in query_variants]
             )
@@ -217,7 +272,7 @@ class Memory:
             self._mark_records_retrieved(ranked[:limit], records)
             return ranked[:limit]
 
-        summary_candidates = self._merge_unique(self._candidate_pool(include_chunks=False), entity_candidates)
+        summary_candidates = self._merge_unique(self._candidate_pool(include_chunks=False), entity_candidates, session_candidates)
         if recent_query:
             summary_candidates = self._merge_unique(recent_candidates, summary_candidates)
         summary_ranked, summary_best = self._rank_candidates(
@@ -229,7 +284,7 @@ class Memory:
             self._mark_records_retrieved(summary_ranked[:limit], records)
             return summary_ranked[:limit]
 
-        full_candidates = self._merge_unique(self._candidate_pool(include_chunks=True), entity_candidates)
+        full_candidates = self._merge_unique(self._candidate_pool(include_chunks=True), entity_candidates, session_candidates)
         if recent_candidates:
             full_candidates = self._merge_unique(recent_candidates, full_candidates)
         vector_hit_records = self._merge_unique_records(
@@ -260,10 +315,11 @@ class Memory:
         brain: Any | None = None,
         should_extract: bool = True,
         background: bool = False,
+        turn_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._log_message("user", user_message, tool_trace)
         self._log_message("assistant", assistant_message, tool_trace)
-        self._append_session_turns(session_id, user_message, assistant_message, tool_trace)
+        self._append_session_turns(session_id, user_message, assistant_message, tool_trace, turn_meta=turn_meta)
 
         if not should_extract:
             return {"stored": 0, "chunks": []}
@@ -305,16 +361,13 @@ class Memory:
 
     def load_recent_messages(self, limit_messages: int = 12) -> list[dict[str, str]]:
         collected: list[dict[str, str]] = []
-        for session_file in self._recent_session_files():
-            payload = self._load_session_payload(session_file)
-            messages = payload.get("messages", [])
-            if not isinstance(messages, list):
+        for session in self.session_store.list_sessions(limit=4):
+            session_id = str(session.get("session_id", "")).strip()
+            if not session_id:
                 continue
-            for message in reversed(messages):
+            for message in reversed(self.session_store.load_messages(session_id, limit_messages=limit_messages)):
                 if len(collected) >= limit_messages:
                     break
-                if not isinstance(message, dict):
-                    continue
                 role = str(message.get("role", "")).strip().lower()
                 content = str(message.get("content", "")).strip()
                 if role not in {"user", "assistant"} or not content:
@@ -330,26 +383,8 @@ class Memory:
     def load_session_messages(self, session_id: str, limit_messages: int = 12) -> list[dict[str, str]]:
         if not session_id:
             return self.load_recent_messages(limit_messages)
-
-        session_path = self.sessions_dir / f"session_{session_id}.json"
-        payload = self._load_session_payload(session_path)
-        messages = payload.get("messages", [])
-        if not isinstance(messages, list):
-            return self.load_recent_messages(limit_messages)
-
-        collected: list[dict[str, str]] = []
-        for message in reversed(messages):
-            if len(collected) >= limit_messages:
-                break
-            if not isinstance(message, dict):
-                continue
-            role = str(message.get("role", "")).strip().lower()
-            content = str(message.get("content", "")).strip()
-            if role not in {"user", "assistant"} or not content:
-                continue
-            collected.append({"role": role, "content": content})
-        collected.reverse()
-        return collected
+        messages = self.session_store.load_messages(session_id, limit_messages=limit_messages)
+        return messages
 
     def ensure_index_current(self) -> None:
         current_state = self._memory_source_state()
@@ -414,45 +449,16 @@ class Memory:
         user_message: str,
         assistant_message: str,
         tool_trace: list[dict[str, Any]] | None = None,
+        turn_meta: dict[str, Any] | None = None,
     ) -> None:
         if not session_id:
             return
-
-        session_path = self.sessions_dir / f"session_{session_id}.json"
-        payload = self._load_session_payload(session_path)
-        messages = payload.get("messages", [])
-        if not isinstance(messages, list):
-            messages = []
-
-        timestamp = datetime.now().isoformat()
-        tool_names = [item.get("name") for item in (tool_trace or []) if item.get("name")]
-        if user_message.strip():
-            messages.append(
-                {
-                    "timestamp": timestamp,
-                    "role": "user",
-                    "content": user_message.strip(),
-                }
-            )
-        if assistant_message.strip():
-            messages.append(
-                {
-                    "timestamp": timestamp,
-                    "role": "assistant",
-                    "content": assistant_message.strip(),
-                    "tools_used": tool_names,
-                }
-            )
-
-        session_payload = {
-            "session_id": session_id,
-            "created_at": payload.get("created_at") or timestamp,
-            "updated_at": timestamp,
-            "messages": messages,
-        }
-        session_path.write_text(
-            json.dumps(session_payload, ensure_ascii=True, indent=2),
-            encoding="utf-8",
+        self.session_store.append_turn(
+            session_id=session_id,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            tool_trace=tool_trace,
+            turn_meta=turn_meta,
         )
 
     def _extract_memories(
@@ -1316,16 +1322,29 @@ class Memory:
         self._save_records_payload(payload)
 
     def _recent_session_files(self, limit_files: int = 4) -> list[Path]:
-        files = sorted(
-            self.sessions_dir.glob("session_*.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        return files[:limit_files]
+        files: list[Path] = []
+        for session in self.session_store.list_sessions(limit=limit_files):
+            file_name = str(session.get("file_name", "")).strip()
+            if file_name:
+                files.append(self.sessions_dir / file_name)
+        return files
 
     def _load_session_payload(self, session_path: Path) -> dict[str, Any]:
         if not session_path.exists():
             return {}
+        if session_path.suffix.lower() == ".jsonl":
+            messages = []
+            try:
+                for line in session_path.read_text(encoding="utf-8").splitlines():
+                    payload = self._safe_json(line)
+                    if isinstance(payload, dict) and payload.get("role") in {"user", "assistant"}:
+                        messages.append(payload)
+            except OSError:
+                return {}
+            return {
+                "session_id": session_path.stem,
+                "messages": messages,
+            }
         try:
             payload = self._safe_json(session_path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
@@ -1335,33 +1354,40 @@ class Memory:
         return {}
 
     def _recent_session_candidates(self, max_turns: int = 24) -> list[str]:
-        candidates: list[str] = []
-        for session_file in self._recent_session_files():
-            payload = self._load_session_payload(session_file)
-            messages = payload.get("messages", [])
-            if not isinstance(messages, list):
-                continue
+        return self.session_store.recent_session_candidates(limit_files=4, max_turns=max_turns)
 
-            pending_user: dict[str, Any] | None = None
-            for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                role = str(message.get("role", "")).strip().lower()
-                content = str(message.get("content", "")).strip()
-                timestamp = str(message.get("timestamp", "")).strip()
-                if not content:
-                    continue
-                if role == "user":
-                    pending_user = {"content": content, "timestamp": timestamp}
-                    continue
-                if role == "assistant" and pending_user is not None:
-                    summary = (
-                        f"Recent chat on {timestamp or pending_user.get('timestamp', '')}: "
-                        f"User asked '{pending_user.get('content', '')}' and JARVIS answered '{content}'."
-                    ).strip()
-                    candidates.append(summary)
-                    pending_user = None
-        return candidates[-max_turns:]
+    def _session_candidates(self, query: str, limit: int) -> list[str]:
+        lowered = query.lower()
+        session_markers = (
+            "session",
+            "discuss",
+            "talk about",
+            "worked on",
+            "working on",
+            "what did we",
+            "last time",
+            "earlier session",
+        )
+        if not any(marker in lowered for marker in session_markers):
+            return []
+
+        matches = self.session_store.search_sessions(query, max(1, limit))
+        candidates: list[str] = []
+        for match in matches:
+            display_name = str(match.get("display_name", "Untitled session")).strip()
+            updated_at = str(match.get("updated_at", "")).strip()
+            snippets = [
+                str(snippet).strip()
+                for snippet in match.get("snippets", [])
+                if str(snippet).strip()
+            ]
+            if snippets:
+                candidates.append(
+                    f'Session "{display_name}" updated {updated_at}: ' + " | ".join(snippets)
+                )
+            else:
+                candidates.append(f'Session "{display_name}" updated {updated_at}.')
+        return candidates
 
     def _recent_log_candidates(self, max_turns: int = 24) -> list[str]:
         log_files = sorted(self.logs_dir.glob("*.jsonl"), reverse=True)

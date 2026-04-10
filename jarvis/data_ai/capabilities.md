@@ -14,6 +14,7 @@
 - Read today's calendar events and create new events after Google Calendar OAuth setup
 - Capture screenshots and attempt vision analysis when the configured backend/model supports image input
 - Launch local apps by name or executable path
+- Name sessions, list recent sessions, and search past named sessions
 - Open browser pages and fetch page content in a basic way
 - Remember past conversation chunks and search memory
 - Create new tool modules with validation, dry-run checks, and self-update logging

@@ -17,3 +17,4 @@
 17. Use `calculator_tool` for arithmetic and unit conversions instead of doing mental math when precision matters.
 18. Use `system_info_tool` for CPU, RAM, disk, battery, or process questions instead of guessing from general knowledge.
 19. Use `clipboard_tool`, `notes_tool`, and `reminder_tool` when the user is clearly asking for clipboard actions, intentional notes, or scheduled reminders.
+20. Use `session_tool` when the user explicitly wants to rename the current session, inspect the current session, list recent sessions, or search a specific past session by topic or name.

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any, Callable
 
 from config.settings import SETTINGS, Settings
 from core.brain import Brain
+from core.interface_config import INTERFACE_CONFIG
 from core.memory import Memory
 from core.planner import Planner
 from core.tool_registry import ToolRegistry
@@ -29,14 +31,54 @@ class Agent:
         self.tools = tools or ToolRegistry(settings=self.settings)
         self.memory = memory or Memory(self.settings)
         self.planner = planner or Planner(self.brain)
+        self.interface = INTERFACE_CONFIG
         self.session_id = ""
+        self.mode = self.interface.default_mode()
+        self.session_meta: dict[str, Any] = {}
+        self.last_turn_meta: dict[str, Any] = {}
         self.history: list[dict[str, Any]] = []
+        self._startup_messages_emitted = False
         self.bind_session()
 
-    def bind_session(self, session_id: str | None = None) -> str:
+    def bind_session(self, session_id: str | None = None, mode: str | None = None) -> str:
         self.session_id = session_id or uuid.uuid4().hex[:12]
+        self.mode = self.interface.normalize_mode(mode or self.mode)
+        self.session_meta = self.memory.ensure_session(self.session_id, mode=self.mode)
+        self.mode = self.interface.normalize_mode(self.session_meta.get("mode", self.mode))
         self.history = self.memory.load_session_messages(self.session_id, limit_messages=12)
+        self._startup_messages_emitted = False
         return self.session_id
+
+    def set_mode(self, mode: str) -> dict[str, Any]:
+        normalized = self.interface.normalize_mode(mode)
+        previous_mode = self.mode
+        self.mode = normalized
+        if self.session_id:
+            self.session_meta = self.memory.set_session_mode(self.session_id, normalized)
+        else:
+            self.bind_session(mode=normalized)
+        self.mode = self.interface.normalize_mode(self.session_meta.get("mode", normalized))
+        if self.mode != previous_mode:
+            self._startup_messages_emitted = False
+        return dict(self.session_meta)
+
+    def rename_session(self, new_name: str) -> dict[str, Any]:
+        if not self.session_id:
+            self.bind_session()
+        self.session_meta = self.memory.rename_session(self.session_id, new_name)
+        return dict(self.session_meta)
+
+    def startup_messages(self) -> list[str]:
+        if self._startup_messages_emitted:
+            return []
+        mode_config = self.interface.get_mode(self.mode)
+        messages: list[str] = []
+        if mode_config.get("briefing_on_start") and not self.history:
+            briefing = self._build_briefing()
+            if briefing:
+                messages.append(briefing)
+        self._startup_messages_emitted = True
+        return messages
 
     def run(
         self,
@@ -44,6 +86,7 @@ class Agent:
         stream_handler: Callable[[str], None] | None = None,
         event_handler: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        mode_config = self.interface.get_mode(self.mode)
         self.tools.refresh()
         memory_context = self._load_memory_context(user_message)
         all_tool_definitions = self.tools.get_tool_definitions()
@@ -56,19 +99,84 @@ class Agent:
             memory_context,
         )
 
-        messages = self._build_messages(user_message, memory_context, plan_note)
+        if event_handler is not None and mode_config.get("show_debug"):
+            if memory_context:
+                event_handler(
+                    {
+                        "type": "activity",
+                        "payload": {
+                            "event": "memory_context_loaded",
+                            "message": "; ".join(memory_context[:4]),
+                        },
+                    }
+                )
+            if plan_note and plan_note != "No explicit plan required.":
+                event_handler(
+                    {
+                        "type": "activity",
+                        "payload": {
+                            "event": "plan_ready",
+                            "message": plan_note,
+                        },
+                    }
+                )
+
+        focus_redirect = self._focus_redirect(user_message, mode_config)
+        if focus_redirect:
+            if event_handler is not None:
+                event_handler(
+                    {
+                        "type": "activity",
+                        "payload": {
+                            "event": "focus_redirected",
+                            "message": focus_redirect,
+                        },
+                    }
+                )
+            return self._finalize_response(
+                user_message,
+                focus_redirect,
+                [],
+                [],
+                turn_meta={"mode": self.mode, "tool_count": 0},
+            )
+
+        messages = self._build_messages(user_message, memory_context, plan_note, mode_config)
         tool_trace: list[dict[str, Any]] = []
         task_kind = self._task_kind(user_message, plan)
+        total_started_at = time.perf_counter()
+        last_response_meta: dict[str, Any] = {}
 
         for _ in range(self.settings.agent_max_iterations):
             active_stream_handler = stream_handler if (not tool_definitions or tool_trace) else None
+            brain_started_at = time.perf_counter()
             response = self.brain.chat(
                 messages=messages,
                 tools=tool_definitions,
                 task_kind=task_kind,
                 stream_handler=active_stream_handler,
             )
+            response_latency_ms = int((time.perf_counter() - brain_started_at) * 1000)
             tool_calls = response.get("tool_calls", [])
+            last_response_meta = {
+                "provider": response.get("provider", ""),
+                "model": response.get("model", ""),
+                "latency_ms": response_latency_ms,
+            }
+
+            if event_handler is not None and mode_config.get("show_debug"):
+                event_handler(
+                    {
+                        "type": "activity",
+                        "payload": {
+                            "event": "provider_selected",
+                            "message": (
+                                f"{response.get('provider', 'unknown')} | "
+                                f"{response.get('model', 'unknown')} | {response_latency_ms} ms"
+                            ),
+                        },
+                    }
+                )
 
             if not tool_calls:
                 final_answer = response.get("content", "").strip() or "No response generated."
@@ -77,6 +185,15 @@ class Agent:
                     final_answer,
                     messages,
                     tool_trace,
+                    turn_meta={
+                        "mode": self.mode,
+                        "provider": response.get("provider", ""),
+                        "model": response.get("model", ""),
+                        "latency_ms": response_latency_ms,
+                        "total_latency_ms": int((time.perf_counter() - total_started_at) * 1000),
+                        "tool_count": len(tool_trace),
+                        "plan_note": plan_note if plan_note != "No explicit plan required." else "",
+                    },
                 )
 
             messages.append(
@@ -97,7 +214,15 @@ class Agent:
                             "arguments": tool_call.get("arguments", {}),
                         }
                     )
-                result = self.tools.run_tool(tool_call["name"], tool_call.get("arguments", {}))
+                result = self.tools.run_tool(
+                    tool_call["name"],
+                    tool_call.get("arguments", {}),
+                    runtime_context={
+                        "session_id": self.session_id,
+                        "session_mode": self.mode,
+                        "session_name": str(self.session_meta.get("display_name", "")).strip(),
+                    },
+                )
                 tool_trace.append(
                     {
                         "name": tool_call["name"],
@@ -134,6 +259,15 @@ class Agent:
             final_answer,
             messages,
             tool_trace,
+            turn_meta={
+                "mode": self.mode,
+                "provider": last_response_meta.get("provider", ""),
+                "model": last_response_meta.get("model", ""),
+                "latency_ms": last_response_meta.get("latency_ms"),
+                "total_latency_ms": int((time.perf_counter() - total_started_at) * 1000),
+                "tool_count": len(tool_trace),
+                "plan_note": plan_note if plan_note != "No explicit plan required." else "",
+            },
         )
 
     def _build_messages(
@@ -141,9 +275,14 @@ class Agent:
         user_message: str,
         memory_context: list[str],
         plan_note: str,
+        mode_config: dict[str, Any],
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         daily_summary = self.memory.get_daily_context_summary(self.brain)
+
+        mode_prompt = str(mode_config.get("system_prompt", "")).strip()
+        if mode_prompt:
+            messages.append({"role": "system", "content": mode_prompt})
 
         if daily_summary:
             messages.append(
@@ -177,6 +316,86 @@ class Agent:
         if not self._should_query_memory(user_message):
             return []
         return self.memory.recall(user_message, self.settings.memory_top_k)
+
+    def _focus_redirect(self, user_message: str, mode_config: dict[str, Any]) -> str:
+        focus_filter = mode_config.get("focus_filter", {})
+        if not isinstance(focus_filter, dict) or not focus_filter.get("enabled"):
+            return ""
+
+        lowered = user_message.lower().strip()
+        if not lowered:
+            return ""
+
+        task_markers = [str(item).strip().lower() for item in focus_filter.get("task_markers", []) if str(item).strip()]
+        small_talk_markers = [str(item).strip().lower() for item in focus_filter.get("small_talk_markers", []) if str(item).strip()]
+        task_hits = sum(1 for marker in task_markers if marker and marker in lowered)
+        small_talk_hits = sum(1 for marker in small_talk_markers if marker and marker in lowered)
+        if small_talk_hits <= 0:
+            return ""
+        if task_hits >= small_talk_hits:
+            return ""
+        return str(focus_filter.get("redirect_message", "")).strip()
+
+    def _build_briefing(self) -> str:
+        config = self.interface.briefing()
+        intro = str(config.get("intro", "Here is the current session snapshot.")).strip()
+        max_items = max(1, int(config.get("max_items_per_section", 5) or 5))
+        sections: list[str] = [intro]
+
+        project_items = self.memory.active_project_items(limit=max_items)
+        project_heading = str(config.get("projects_heading", "Active projects")).strip() or "Active projects"
+        empty_projects = str(config.get("empty_projects", "No active project notes found.")).strip()
+        if project_items:
+            sections.append(project_heading + ":\n" + "\n".join(f"- {item}" for item in project_items[:max_items]))
+        else:
+            sections.append(f"{project_heading}:\n- {empty_projects}")
+
+        reminder_heading = str(config.get("reminders_heading", "Pending reminders")).strip() or "Pending reminders"
+        empty_reminders = str(config.get("empty_reminders", "No pending reminders.")).strip()
+        reminder_lines: list[str] = []
+        try:
+            from services.reminders import get_reminder_service
+
+            reminders = get_reminder_service(self.settings).list_reminders(include_completed=False)
+            for reminder in reminders[:max_items]:
+                if not isinstance(reminder, dict):
+                    continue
+                text = str(reminder.get("text", "")).strip()
+                due_at = str(reminder.get("due_at_local") or reminder.get("due_at", "")).strip()
+                if text:
+                    reminder_lines.append(f"- {text}" + (f" | due {due_at}" if due_at else ""))
+        except Exception:
+            reminder_lines = []
+        sections.append(
+            reminder_heading + ":\n" + ("\n".join(reminder_lines) if reminder_lines else f"- {empty_reminders}")
+        )
+
+        calendar_heading = str(config.get("calendar_heading", "Today's calendar")).strip() or "Today's calendar"
+        empty_calendar = str(config.get("empty_calendar", "No calendar events scheduled for today.")).strip()
+        calendar_lines: list[str] = []
+        try:
+            from services.calendar_service import get_calendar_service
+
+            events = get_calendar_service().today_events(max_results=max_items)
+            for event in events[:max_items]:
+                if not isinstance(event, dict):
+                    continue
+                summary = str(event.get("summary", "")).strip() or "(untitled event)"
+                start = str(event.get("start", "")).strip()
+                location = str(event.get("location", "")).strip()
+                line = f"- {summary}"
+                if start:
+                    line += f" | {start}"
+                if location:
+                    line += f" | {location}"
+                calendar_lines.append(line)
+        except Exception:
+            calendar_lines = []
+        sections.append(
+            calendar_heading + ":\n" + ("\n".join(calendar_lines) if calendar_lines else f"- {empty_calendar}")
+        )
+
+        return "\n\n".join(part for part in sections if part.strip()).strip()
 
     def _task_kind(self, user_message: str, plan: dict[str, Any]) -> str:
         lowered = user_message.lower()
@@ -351,8 +570,10 @@ class Agent:
         assistant_message: str,
         messages: list[dict[str, Any]],
         tool_trace: list[dict[str, Any]],
+        turn_meta: dict[str, Any] | None = None,
     ) -> str:
         self._remember_turn(user_message, assistant_message)
+        self.last_turn_meta = dict(turn_meta or {})
         self.memory.persist_conversation(
             user_message=user_message,
             assistant_message=assistant_message,
@@ -365,5 +586,9 @@ class Agent:
             brain=self.brain,
             should_extract=self._should_extract_memory(user_message, tool_trace),
             background=self.settings.background_memory_persistence,
+            turn_meta=turn_meta,
         )
+        latest_session = self.memory.get_session(self.session_id)
+        if isinstance(latest_session, dict):
+            self.session_meta = latest_session
         return assistant_message

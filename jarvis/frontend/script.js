@@ -4,7 +4,9 @@ const API = (typeof window !== 'undefined' && window.location.origin)
     : 'http://localhost:8000';
 
 let sessionId = null;
-let currentMode = 'jarvis';
+let sessionMeta = null;
+let interfaceConfig = null;
+let currentMode = 'normal';
 let isStreaming = false;
 let isListening = false;
 let camStream = null;
@@ -32,7 +34,8 @@ const newChatBtn   = $('new-chat-btn');
 const charCount    = $('char-count');
 const welcomeTitle = $('welcome-title');
 const modeSlider   = $('mode-slider');
-const btnJarvis    = $('btn-jarvis');
+const modeSwitch   = $('mode-switch');
+const sessionDisplay = $('session-display');
 const statusDot    = document.querySelector('.status-dot');
 const statusText   = document.querySelector('.status-text');
 const orbContainer = $('orb-container');
@@ -153,7 +156,7 @@ class TTSPlayer {
     }
 }
 
-function init() {
+async function init() {
     if (!chatMessages || !messageInput) {
         console.error('[JARVIS] Required DOM elements (chat-messages, message-input) not found.');
         return;
@@ -165,6 +168,7 @@ function init() {
     setGreeting();
     initOrb();
     initSpeech();
+    await loadInterfaceConfig();
     checkHealth();
     bindEvents();
     setMode(currentMode);
@@ -188,6 +192,72 @@ function saveSettings() {
     try {
         localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     } catch (_) {}
+}
+
+async function loadInterfaceConfig() {
+    try {
+        const res = await fetch(`${API}/interface/config`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const payload = await res.json();
+        interfaceConfig = payload;
+        currentMode = (payload.default_mode || currentMode || 'normal').trim() || 'normal';
+        renderModeButtons(Array.isArray(payload.modes) ? payload.modes : []);
+    } catch (err) {
+        interfaceConfig = {
+            default_mode: 'normal',
+            modes: [{ key: 'normal', label: 'Normal', summary: 'Balanced chat and task execution.' }],
+        };
+        currentMode = 'normal';
+        renderModeButtons(interfaceConfig.modes);
+        if (typeof console !== 'undefined' && console.warn) console.warn('[Interface] Config load failed:', err);
+    }
+}
+
+function renderModeButtons(modes) {
+    if (!modeSwitch) return;
+    const list = Array.isArray(modes) && modes.length ? modes : [{ key: 'normal', label: 'Normal' }];
+    modeSwitch.innerHTML = '';
+    if (modeSlider) modeSwitch.appendChild(modeSlider);
+    modeSwitch.classList.remove('mode-switch-single', 'mode-switch-three', 'mode-switch-multi');
+    if (list.length <= 1) modeSwitch.classList.add('mode-switch-single');
+    else if (list.length === 3) modeSwitch.classList.add('mode-switch-three');
+    else modeSwitch.classList.add('mode-switch-multi');
+
+    for (const mode of list) {
+        const button = document.createElement('button');
+        button.className = 'mode-btn';
+        button.dataset.mode = String(mode.key || '').trim() || 'normal';
+        button.title = String(mode.summary || mode.label || '').trim();
+        button.innerHTML = `<span class="mode-btn-text">${escapeHtml(String(mode.label || mode.key || 'Mode'))}</span>`;
+        modeSwitch.appendChild(button);
+    }
+}
+
+function renderSessionMeta(session) {
+    if (!session || typeof session !== 'object') return;
+    sessionMeta = session;
+    if (session.session_id) sessionId = session.session_id;
+    if (session.mode) currentMode = session.mode;
+    if (sessionDisplay) {
+        const name = (session.display_name || 'New session').trim();
+        const mode = (session.mode_label || session.mode || '').trim();
+        sessionDisplay.textContent = mode ? `${name} • ${mode}` : name;
+    }
+    setMode(currentMode);
+}
+
+function appendStartupMessages(messages) {
+    if (!Array.isArray(messages)) return;
+    for (const message of messages) {
+        const text = String(message || '').trim();
+        if (text) addMessage('assistant', text);
+    }
+}
+
+function currentModeLabel() {
+    const modes = interfaceConfig && Array.isArray(interfaceConfig.modes) ? interfaceConfig.modes : [];
+    const match = modes.find(mode => String(mode.key || '') === String(currentMode || ''));
+    return match ? String(match.label || match.key || 'Mode') : 'Jarvis';
 }
 
 
@@ -709,6 +779,7 @@ async function sendMessageWithImage(text, imgBase64) {
             body: JSON.stringify({
                 message: messageToSend,
                 session_id: sessionId,
+                mode: currentMode,
                 tts: !!(ttsPlayer && ttsPlayer.enabled),
                 imgbase64: imgBase64,
             }),
@@ -737,6 +808,8 @@ async function sendMessageWithImage(text, imgBase64) {
                 try {
                     const data = JSON.parse(line.slice(6));
                     if (data.session_id) sessionId = data.session_id;
+                    if (data.session) renderSessionMeta(data.session);
+                    if (data.startup_message) addMessage('assistant', data.startup_message);
                     if (data.activity) {
                         appendActivity(data.activity);
                         if (activityToggle) activityToggle.style.display = '';
@@ -852,8 +925,16 @@ function bindEvents() {
         ttsBtn.classList.toggle('tts-active', ttsPlayer && ttsPlayer.enabled);
         if (ttsPlayer && !ttsPlayer.enabled) ttsPlayer.stop();
     });
-    if (newChatBtn) newChatBtn.addEventListener('click', newChat);
-    if (btnJarvis) btnJarvis.addEventListener('click', () => setMode('jarvis'));
+    if (newChatBtn) newChatBtn.addEventListener('click', () => { if (!isStreaming) newChat(); });
+    if (modeSwitch) {
+        modeSwitch.addEventListener('click', async (event) => {
+            const button = event.target.closest('.mode-btn');
+            if (!button || isStreaming) return;
+            const mode = String(button.dataset.mode || '').trim();
+            if (!mode) return;
+            await changeMode(mode);
+        });
+    }
     document.querySelectorAll('.chip').forEach(c => {
         c.addEventListener('click', () => { if (!isStreaming) sendMessage(c.dataset.msg); });
     });
@@ -919,16 +1000,55 @@ function updatePanelOverlay() {
 }
 
 function setMode(mode) {
-    currentMode = mode || 'jarvis';
-    if (btnJarvis) btnJarvis.classList.add('active');
+    currentMode = mode || (interfaceConfig && interfaceConfig.default_mode) || 'normal';
+    const buttons = modeSwitch ? Array.from(modeSwitch.querySelectorAll('.mode-btn')) : [];
+    buttons.forEach(button => {
+        button.classList.toggle('active', button.dataset.mode === currentMode);
+    });
     if (modeSlider) modeSlider.classList.remove('center', 'right');
     if (activityToggle) activityToggle.style.display = '';
 }
 
-function newChat() {
+async function createSession(mode, existingSessionId = null) {
+    const response = await fetch(`${API}/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            session_id: existingSessionId,
+            mode: mode || currentMode || 'normal',
+        }),
+    });
+    if (!response.ok) {
+        throw new Error(`Failed to create session (${response.status})`);
+    }
+    const payload = await response.json();
+    if (payload.session) renderSessionMeta(payload.session);
+    appendStartupMessages(payload.startup_messages || []);
+    return payload;
+}
+
+async function changeMode(mode) {
+    setMode(mode);
+    if (!sessionId) return;
+    const response = await fetch(`${API}/sessions/${encodeURIComponent(sessionId)}/mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+    });
+    if (!response.ok) {
+        showToast('Could not switch mode.');
+        return;
+    }
+    const payload = await response.json().catch(() => null);
+    if (payload && payload.session) renderSessionMeta(payload.session);
+    appendStartupMessages(payload && payload.startup_messages ? payload.startup_messages : []);
+}
+
+async function newChat() {
     if (ttsPlayer) ttsPlayer.stop();
     if (camStream) stopCamera();
     sessionId = null;
+    sessionMeta = null;
     if (chatMessages) chatMessages.innerHTML = '';
     chatMessages.appendChild(createWelcome());
     messageInput.value = '';
@@ -943,6 +1063,12 @@ function newChat() {
         activityList.innerHTML = '<div class="activity-empty" id="activity-empty">Send a message to see the flow here.</div>';
     }
     updatePanelOverlay();
+    if (sessionDisplay) sessionDisplay.textContent = 'New session';
+    if (currentMode === 'briefing') {
+        try {
+            await createSession(currentMode);
+        } catch (_) {}
+    }
 }
 
 function createWelcome() {
@@ -1048,6 +1174,10 @@ function escapeAttr(str) {
 
 const ACTIVITY_STEPS = {
     query_detected:      { step: 1, label: 'Query detected' },
+    memory_context_loaded: { step: 2, label: 'Memory context' },
+    plan_ready:          { step: 3, label: 'Plan ready' },
+    provider_selected:   { step: 4, label: 'Provider selected' },
+    focus_redirected:    { step: 0, label: 'Focus redirect' },
     decision:            { step: 2, label: 'Primary Brain' },
     intent_classified:   { step: 3, label: 'Task Brain' },
     routing:             { step: 4, label: 'Route selected' },
@@ -1093,6 +1223,18 @@ function appendActivity(activity) {
     } else if (activity.event === 'routing') {
         detail = `→ ${(activity.route || '?').charAt(0).toUpperCase() + (activity.route || '').slice(1)}`;
         addRouteClass(activity.route);
+    } else if (activity.event === 'memory_context_loaded') {
+        detail = activity.message || 'Loaded memory context';
+        item.classList.add('activity-sub');
+    } else if (activity.event === 'plan_ready') {
+        detail = activity.message || 'Execution plan prepared';
+        item.classList.add('activity-sub', 'route-task');
+    } else if (activity.event === 'provider_selected') {
+        detail = activity.message || 'Provider selected';
+        item.classList.add('activity-sub');
+    } else if (activity.event === 'focus_redirected') {
+        detail = activity.message || 'Focus mode filtered the message';
+        item.classList.add('activity-sub');
     } else if (activity.event === 'tasks_executing') {
         detail = activity.message || 'Running tasks...';
         item.classList.add('activity-sub', 'route-task');
@@ -1164,7 +1306,7 @@ function addMessage(role, text) {
     const label = document.createElement('div');
     label.className = 'msg-label';
     label.textContent = role === 'assistant'
-        ? `Jarvis  (${currentMode === 'jarvis' ? 'Jarvis' : currentMode === 'realtime' ? 'Realtime' : 'General'})`
+        ? `Jarvis (${currentModeLabel()})`
         : 'You';
     const content = document.createElement('div');
     content.className = 'msg-content';
@@ -1190,7 +1332,7 @@ function addTypingIndicator() {
     body.className = 'msg-body';
     const label = document.createElement('div');
     label.className = 'msg-label';
-    label.textContent = `Jarvis  (${currentMode === 'jarvis' ? 'Jarvis' : currentMode === 'realtime' ? 'Realtime' : 'General'})`;
+    label.textContent = `Jarvis (${currentModeLabel()})`;
     const content = document.createElement('div');
     content.className = 'msg-content';
     content.innerHTML = '<span class="msg-stream-text">...</span>';
@@ -1272,6 +1414,7 @@ async function sendMessage(textOverride) {
             body: JSON.stringify({
                 message: messageToSend,
                 session_id: sessionId,
+                mode: currentMode,
                 tts: !!(ttsPlayer && ttsPlayer.enabled),
                 imgbase64: imgBase64 || null
             }),
@@ -1307,6 +1450,8 @@ async function sendMessage(textOverride) {
                 try {
                     const data = JSON.parse(line.slice(6));
                     if (data.session_id) sessionId = data.session_id;
+                    if (data.session) renderSessionMeta(data.session);
+                    if (data.startup_message) addMessage('assistant', data.startup_message);
                     if (data.activity) {
                         appendActivity(data.activity);
                         if (activityToggle) activityToggle.style.display = '';
@@ -1383,4 +1528,9 @@ async function sendMessage(textOverride) {
     }
 }
 
-document.addEventListener('DOMContentLoaded', init);
+document.addEventListener('DOMContentLoaded', () => {
+    init().catch(err => {
+        if (typeof console !== 'undefined' && console.error) console.error('[JARVIS] Init failed:', err);
+        showToast('Interface failed to initialize.');
+    });
+});

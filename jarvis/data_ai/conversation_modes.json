@@ -1,0 +1,94 @@
+{
+  "default_mode": "normal",
+  "modes": {
+    "normal": {
+      "label": "Normal",
+      "summary": "Balanced chat and task execution.",
+      "system_prompt": "Operate normally and answer naturally while staying concise.",
+      "show_debug": false,
+      "briefing_on_start": false,
+      "focus_filter": {
+        "enabled": false
+      }
+    },
+    "focus": {
+      "label": "Focus",
+      "summary": "Stay task-focused and filter small talk.",
+      "system_prompt": "Stay task-focused. Prefer concise execution-oriented replies and steer the conversation back to actionable work when the message is off-topic.",
+      "show_debug": false,
+      "briefing_on_start": false,
+      "focus_filter": {
+        "enabled": true,
+        "redirect_message": "Focus mode is active. Send the task, blocker, or next step you want handled.",
+        "small_talk_markers": [
+          "hi",
+          "hello",
+          "hey",
+          "how are you",
+          "what's up",
+          "whats up",
+          "yo",
+          "sup",
+          "tell me a joke",
+          "joke",
+          "bored",
+          "thanks",
+          "thank you"
+        ],
+        "task_markers": [
+          "build",
+          "write",
+          "fix",
+          "debug",
+          "create",
+          "make",
+          "plan",
+          "remind",
+          "open",
+          "search",
+          "find",
+          "summarize",
+          "review",
+          "explain",
+          "calendar",
+          "reminder",
+          "file",
+          "code",
+          "project",
+          "task"
+        ]
+      }
+    },
+    "briefing": {
+      "label": "Briefing",
+      "summary": "Start sessions with an operational summary.",
+      "system_prompt": "Be operational, concise, and status-oriented when summarizing the user's current state.",
+      "show_debug": false,
+      "briefing_on_start": true,
+      "focus_filter": {
+        "enabled": false
+      }
+    },
+    "debug": {
+      "label": "Debug",
+      "summary": "Expose planning, tool, provider, and latency details.",
+      "system_prompt": "Be transparent and precise. Keep user-facing answers concise while the interface exposes debug telemetry.",
+      "show_debug": true,
+      "briefing_on_start": false,
+      "focus_filter": {
+        "enabled": false
+      }
+    }
+  },
+  "briefing": {
+    "title": "Session briefing",
+    "intro": "Here is the current operational snapshot.",
+    "projects_heading": "Pending tasks and active projects",
+    "reminders_heading": "Pending reminders",
+    "calendar_heading": "Today's calendar",
+    "empty_projects": "No active project notes found.",
+    "empty_reminders": "No pending reminders.",
+    "empty_calendar": "No calendar events scheduled for today.",
+    "max_items_per_section": 5
+  }
+}

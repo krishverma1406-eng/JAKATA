@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field
 
 from config.settings import BASE_DIR, SETTINGS
 from core.agent import Agent
+from core.interface_config import INTERFACE_CONFIG
+from core.memory import Memory
 from services.tts import synthesize_base64_sync
 
 
@@ -43,28 +45,65 @@ if FRONTEND_DIR.exists():
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=32000)
     session_id: str | None = None
+    mode: str | None = None
     tts: bool = True
     imgbase64: str | None = None
+
+
+class SessionCreateRequest(BaseModel):
+    session_id: str | None = None
+    mode: str | None = None
+
+
+class SessionRenameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+
+
+class SessionModeRequest(BaseModel):
+    mode: str = Field(..., min_length=1, max_length=40)
 
 
 _SESSIONS: dict[str, Agent] = {}
 _SESSIONS_LOCK = threading.Lock()
 _TASKS: dict[str, dict[str, Any]] = {}
+_SERVER_MEMORY: Memory | None = None
 
 
 def _frontend_file(name: str) -> Path:
     return FRONTEND_DIR / name
 
 
-def _get_agent(session_id: str | None) -> tuple[str, Agent]:
+def _get_memory() -> Memory:
+    global _SERVER_MEMORY
+    if _SERVER_MEMORY is None:
+        _SERVER_MEMORY = Memory(SETTINGS)
+    return _SERVER_MEMORY
+
+
+def _session_payload(agent: Agent) -> dict[str, Any]:
+    meta = dict(agent.session_meta or {})
+    mode_config = agent.interface.get_mode(agent.mode)
+    return {
+        "session_id": agent.session_id,
+        "display_name": str(meta.get("display_name", "")).strip() or "Untitled session",
+        "mode": agent.mode,
+        "mode_label": str(mode_config.get("label", agent.mode)).strip() or agent.mode.title(),
+        "turn_count": int(meta.get("turn_count", 0) or 0),
+        "updated_at": str(meta.get("updated_at", "")).strip(),
+    }
+
+
+def _get_agent(session_id: str | None, mode: str | None = None) -> tuple[str, Agent]:
     with _SESSIONS_LOCK:
         sid = (session_id or "").strip() or uuid.uuid4().hex[:12]
         agent = _SESSIONS.get(sid)
         if agent is None:
             session_settings = replace(SETTINGS, tts_enabled=True)
             agent = Agent(settings=session_settings)
-            agent.bind_session(sid)
+            agent.bind_session(sid, mode=mode)
             _SESSIONS[sid] = agent
+        elif mode:
+            agent.set_mode(mode)
         return sid, agent
 
 
@@ -193,7 +232,7 @@ def _persist_non_tool_turn(agent: Agent, user_message: str, assistant_message: s
 
 
 def _build_stream(request: ChatRequest) -> Any:
-    session_id, agent = _get_agent(request.session_id)
+    session_id, agent = _get_agent(request.session_id, request.mode)
     message = _clean_message(request.message)
     if not message:
         raise HTTPException(status_code=400, detail="Message is empty.")
@@ -237,6 +276,11 @@ def _build_stream(request: ChatRequest) -> Any:
         def event_handler(event: dict[str, Any]) -> None:
             nonlocal route_emitted, stream_started_emitted, current_route
             event_type = event.get("type")
+            if event_type == "activity":
+                payload = event.get("payload", {})
+                if isinstance(payload, dict):
+                    emit({"activity": payload})
+                return
             tool_name = str(event.get("name", "")).strip()
             arguments = event.get("arguments", {})
             result = event.get("result", {})
@@ -296,7 +340,9 @@ def _build_stream(request: ChatRequest) -> Any:
 
         def worker() -> None:
             try:
-                emit({"session_id": session_id})
+                emit({"session_id": session_id, "session": _session_payload(agent)})
+                for startup_message in agent.startup_messages():
+                    emit({"startup_message": startup_message, "session": _session_payload(agent)})
                 emit({"activity": {"event": "query_detected", "message": message}})
 
                 if request.imgbase64:
@@ -318,7 +364,7 @@ def _build_stream(request: ChatRequest) -> Any:
                         if audio:
                             emit({"audio": audio})
                     _persist_non_tool_turn(agent, message, response_text)
-                    emit({"done": True, "session_id": session_id})
+                    emit({"done": True, "session_id": session_id, "session": _session_payload(agent)})
                     return
 
                 response_text = agent.run(message, stream_handler=stream_handler, event_handler=event_handler)
@@ -336,9 +382,9 @@ def _build_stream(request: ChatRequest) -> Any:
                         audio = None
                     if audio:
                         emit({"audio": audio})
-                emit({"done": True, "session_id": session_id})
+                emit({"done": True, "session_id": session_id, "session": _session_payload(agent)})
             except Exception as exc:
-                emit({"error": str(exc), "done": True, "session_id": session_id})
+                emit({"error": str(exc), "done": True, "session_id": session_id, "session": _session_payload(agent)})
             finally:
                 event_queue.put(None)
 
@@ -371,6 +417,64 @@ def health() -> dict[str, Any]:
         "frontend": FRONTEND_DIR.exists(),
         "live_providers": live_providers,
         "sessions": len(_SESSIONS),
+        "default_mode": INTERFACE_CONFIG.default_mode(),
+    }
+
+
+@app.get("/interface/config")
+def interface_config() -> dict[str, Any]:
+    return {
+        "default_mode": INTERFACE_CONFIG.default_mode(),
+        "modes": INTERFACE_CONFIG.list_modes(),
+        "briefing": INTERFACE_CONFIG.briefing(),
+    }
+
+
+@app.post("/sessions")
+def create_session(request: SessionCreateRequest) -> dict[str, Any]:
+    session_id, agent = _get_agent(request.session_id, request.mode)
+    return {
+        "session_id": session_id,
+        "session": _session_payload(agent),
+        "startup_messages": agent.startup_messages(),
+    }
+
+
+@app.get("/sessions")
+def list_sessions(limit: int = 20) -> dict[str, Any]:
+    memory = _get_memory()
+    return {"sessions": memory.list_sessions(limit=max(1, min(limit, 50)))}
+
+
+@app.get("/sessions/search")
+def search_sessions(query: str, limit: int = 8) -> dict[str, Any]:
+    memory = _get_memory()
+    return memory.session_search(query, limit=max(1, min(limit, 25)))
+
+
+@app.post("/sessions/{session_id}/rename")
+def rename_session(session_id: str, request: SessionRenameRequest) -> dict[str, Any]:
+    memory = _get_memory()
+    session = memory.rename_session(session_id, request.name)
+    with _SESSIONS_LOCK:
+        agent = _SESSIONS.get(session_id)
+        if agent is not None:
+            agent.session_meta = dict(session)
+    return {"ok": True, "session": session}
+
+
+@app.post("/sessions/{session_id}/mode")
+def update_session_mode(session_id: str, request: SessionModeRequest) -> dict[str, Any]:
+    with _SESSIONS_LOCK:
+        agent = _SESSIONS.get(session_id)
+    if agent is None:
+        _sid, agent = _get_agent(session_id, request.mode)
+    else:
+        agent.set_mode(request.mode)
+    return {
+        "ok": True,
+        "session": _session_payload(agent),
+        "startup_messages": agent.startup_messages(),
     }
 
 

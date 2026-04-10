@@ -15,6 +15,7 @@
 | `calendar_tool` | The user asks for today's events or to create a calendar event | Requires Google Calendar OAuth setup and client secret/token files |
 | `screenshot_tool` | The user asks to capture the screen or analyze a screenshot | Can capture and can attempt backend vision analysis when supported |
 | `app_launcher_tool` | The user asks to launch a local application by name | Uses local app resolution and OS launch behavior |
+| `session_tool` | The user asks to rename the current session, list recent sessions, inspect the current session, or search discussions from a specific named session | Use this for explicit session management and session search, not for general personal memory |
 | `code_writer` | The user explicitly asks JARVIS to create a new tool, scaffold a feature, or write tool code | Generates code, validates importability, dry-runs `execute()`, and logs success. Do not use silently |
 | `music_player` | The user asks to play or manage local music playback | Uses VLC. Supports local files, folders, fuzzy search, queue/status, volume, and some YouTube URLs via `yt-dlp` |
 | `os_control` | The task needs desktop actions such as screenshots, mouse clicks, typing, scrolling, hotkeys, dragging, or opening local apps | Coordinate-based desktop control only. No vision-guided clicking or UI understanding by itself |
@@ -22,3 +23,5 @@
 For `gmail_tool`, summarize sender, subject, date, and whether action is needed instead of dumping raw message objects unless the user asks for raw details.
 
 For `calendar_tool`, summarize event title, start time, end time, and location instead of dumping raw event objects unless the user asks for raw details.
+
+For `session_tool`, prefer searching or renaming session metadata when the user explicitly refers to a session by name, says "rename this session", or asks what was discussed in a specific session.

@@ -104,6 +104,17 @@ textarea { font-family: var(--font); color: var(--text); }
     letter-spacing: 0.5px;
 }
 
+.session-display {
+    font-size: 0.68rem;
+    font-weight: 500;
+    color: var(--accent-secondary);
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 220px;
+}
+
 .mode-switch {
     position: relative;
     display: flex;
@@ -165,6 +176,21 @@ textarea { font-family: var(--font); color: var(--text); }
 
 .mode-switch-three .mode-slider.right {
     transform: translateX(calc(200% + 4px));
+}
+
+.mode-switch-multi {
+    flex-wrap: wrap;
+    justify-content: center;
+    min-width: min(420px, 100%);
+}
+
+.mode-switch-multi .mode-slider {
+    display: none;
+}
+
+.mode-switch-multi .mode-btn {
+    min-width: 88px;
+    justify-content: center;
 }
 
 .mode-btn {

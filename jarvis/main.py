@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 import threading
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -42,11 +45,21 @@ class CliRenderer:
     def tool(self, message: str) -> None:
         self.console.print(Text(message, style="yellow"))
 
-    def assistant_prefix(self) -> None:
-        self.console.print(Text("JARVIS: ", style="bold green"), end="")
+    def assistant(self, message: str) -> None:
+        sys.stdout.write(f"JARVIS: {message}\n")
+        sys.stdout.flush()
 
-    def assistant_chunk(self, chunk: str) -> None:
-        self.console.print(Text(chunk, style="green"), end="")
+    def assistant_stream_start(self) -> None:
+        sys.stdout.write("JARVIS: ")
+        sys.stdout.flush()
+
+    def assistant_stream_chunk(self, chunk: str) -> None:
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+
+    def assistant_stream_end(self) -> None:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     def user_echo(self, prompt: str) -> None:
         self.console.print(Text(f"You: {prompt}", style="bold cyan"))
@@ -101,7 +114,9 @@ class CliRenderer:
         self.console.print(table)
 
     def input(self) -> str:
-        return self.console.input("[bold cyan]You:[/bold cyan] ")
+        sys.stdout.write("You: ")
+        sys.stdout.flush()
+        return input()
 
 
 def _notify_reminder(
@@ -191,7 +206,46 @@ def main() -> None:
         _run_agent_stream(agent, prompt, renderer=renderer)
         return
 
+    if not agent.settings.stt_enabled and not agent.settings.wake_word_enabled:
+        _run_text_mode(agent, renderer=renderer)
+        return
+
     _run_combined_mode(agent, renderer=renderer)
+
+
+def _run_text_mode(agent: Agent, renderer: CliRenderer) -> None:
+    _initialize_reminders(agent, renderer=renderer)
+    renderer.session_banner()
+    for startup in agent.startup_messages():
+        renderer.briefing(startup)
+
+    renderer.info("JARVIS is ready. Type 'exit' to quit. Modes: typing.")
+    renderer.info("Commands: /modes, /mode <key>, /name <session name>, /session, /sessions [query], /briefing, /new")
+
+    while True:
+        try:
+            user_input = renderer.input().strip()
+        except (EOFError, KeyboardInterrupt):
+            renderer.info("\nJARVIS: Shutting down.")
+            break
+
+        if user_input.lower() in {"exit", "quit"}:
+            renderer.line("JARVIS: Goodbye.")
+            break
+
+        if user_input.startswith("/"):
+            handled = _handle_cli_command(agent, user_input, renderer)
+            if handled == "quit":
+                break
+            continue
+
+        if not user_input:
+            continue
+
+        try:
+            _run_agent_stream(agent, user_input, renderer=renderer, print_lock=None)
+        except Exception as exc:
+            renderer.error(f"Error: {exc}")
 
 
 def _run_combined_mode(agent: Agent, renderer: CliRenderer) -> None:
@@ -379,8 +433,6 @@ def _run_agent_stream(
     renderer: CliRenderer,
     print_lock: threading.Lock | None = None,
 ) -> None:
-    mode_config = agent.interface.get_mode(agent.mode)
-
     def _safe(fn: callable) -> None:
         if print_lock is None:
             fn()
@@ -388,68 +440,37 @@ def _run_agent_stream(
         with print_lock:
             fn()
 
-    def _event_handler(event: dict[str, Any]) -> None:
-        event_type = event.get("type")
-        if event_type == "tool_started":
-            if not mode_config.get("show_debug"):
-                return
-            name = str(event.get("name", "")).strip()
-            arguments = json.dumps(event.get("arguments", {}), ensure_ascii=False, default=str)
-            _safe(lambda: renderer.tool(f"TOOL > {name} {arguments}"))
-            return
-        if event_type == "tool_result" and mode_config.get("show_debug"):
-            name = str(event.get("name", "")).strip()
-            result = event.get("result", {})
-            status = "ok" if isinstance(result, dict) and result.get("ok", True) else "error"
-            _safe(lambda: renderer.tool(f"TOOL < {name} [{status}]"))
-            return
-        if event_type != "activity" or not mode_config.get("show_debug"):
-            return
-        payload = event.get("payload", {})
-        if not isinstance(payload, dict):
-            return
-        event_name = str(payload.get("event", "")).strip()
-        message = str(payload.get("message", "")).strip()
-        if event_name == "memory_context_loaded":
-            items = [item.strip() for item in message.split(";") if item.strip()]
-            _safe(lambda: renderer.memory_context(items))
-            return
-        if message:
-            style = "dim"
-            if event_name in {"plan_ready", "provider_selected"}:
-                style = "yellow"
-            if event_name == "focus_redirected":
-                style = "bold yellow"
-            _safe(lambda: renderer.console.print(Text(message, style=style)))
-
     try:
-        response = agent.run(prompt, event_handler=_event_handler)
+        response = agent.run(prompt)
     except Exception as exc:
         _safe(lambda: renderer.error(f"Agent error: {exc}"))
         import traceback
         _safe(lambda: renderer.console.print(traceback.format_exc(), style="dim red"))
         return
     final_text = response or "No response generated."
-    _safe(lambda: renderer.console.print())
-    _safe(renderer.assistant_prefix)
-    _safe(lambda: renderer.assistant_chunk(final_text))
-    if not final_text.endswith("\n"):
-        _safe(lambda: renderer.console.print())
+    _stream_text = final_text.strip()
+    if not _stream_text:
+        _safe(lambda: renderer.assistant("No response generated."))
+        return
 
-    turn_meta = agent.last_turn_meta
-    if mode_config.get("show_debug") and turn_meta:
-        debug_bits = []
-        provider = str(turn_meta.get("provider", "")).strip()
-        model = str(turn_meta.get("model", "")).strip()
-        latency_ms = turn_meta.get("total_latency_ms")
-        if provider:
-            debug_bits.append(provider)
-        if model:
-            debug_bits.append(model)
-        if latency_ms not in (None, ""):
-            debug_bits.append(f"{latency_ms} ms")
-        if debug_bits:
-            _safe(lambda: renderer.console.print(Text(" | ".join(debug_bits), style="dim")))
+    def _stream_reply(text: str) -> None:
+        renderer.assistant_stream_start()
+        tokens = re.findall(r"\S+\s*", text)
+        if not tokens:
+            renderer.assistant_stream_chunk(text)
+            renderer.assistant_stream_end()
+            return
+        for token in tokens:
+            renderer.assistant_stream_chunk(token)
+            delay = 0.016
+            if token.rstrip().endswith((".", "!", "?")):
+                delay = 0.045
+            elif token.rstrip().endswith((",", ";", ":")):
+                delay = 0.03
+            time.sleep(delay)
+        renderer.assistant_stream_end()
+
+    _safe(lambda: _stream_reply(_stream_text))
 
 
 if __name__ == "__main__":

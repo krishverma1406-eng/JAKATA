@@ -233,7 +233,6 @@ class Memory:
     def recall(self, query: str, limit: int | None = None) -> list[str]:
         limit = limit or self.settings.memory_top_k
         lowered = query.lower()
-        query_variants = self._query_variants(query)
         semantic_ready = self._semantic_retrieval_ready()
         record_payload = self._load_records_payload()
         records = record_payload.get("records", [])
@@ -244,6 +243,7 @@ class Memory:
             for record in records
             if record.get("active", True) and not record.get("demoted")
         ]
+        query_variants = self._query_variants(query, candidate_records=active_records)
         entity_candidates = self._entity_candidates(query)
         session_candidates = self._session_candidates(query, limit * 2)
         record_modifiers = self._record_text_modifiers(active_records)
@@ -264,7 +264,7 @@ class Memory:
                 supplemental_ranked, _ = self._rank_candidates(
                     query_variants,
                     self._merge_unique(
-                        self._candidate_pool(include_facts=True),
+                        self._candidate_pool(include_facts=True, _records=active_records),
                         entity_candidates,
                         session_candidates,
                     ),
@@ -274,7 +274,11 @@ class Memory:
                 return self._merge_unique(recent_ranked, supplemental_ranked)[:limit]
 
         if any(marker in lowered for marker in ("know about me", "remember about me", "who am i", "my profile")):
-            profile_items = self._merge_unique(self._candidate_pool(include_facts=False), entity_candidates, session_candidates)
+            profile_items = self._merge_unique(
+                self._candidate_pool(include_facts=False, _records=active_records),
+                entity_candidates,
+                session_candidates,
+            )
             vector_hit_records = (
                 self._merge_unique_records(*[self._query_vector_store(variant, limit * 2) for variant in query_variants])
                 if semantic_ready
@@ -291,7 +295,11 @@ class Memory:
             self._mark_records_retrieved(ranked[:limit], records)
             return ranked[:limit]
 
-        summary_candidates = self._merge_unique(self._candidate_pool(include_facts=False), entity_candidates, session_candidates)
+        summary_candidates = self._merge_unique(
+            self._candidate_pool(include_facts=False, _records=active_records),
+            entity_candidates,
+            session_candidates,
+        )
         if recent_query:
             summary_candidates = self._merge_unique(recent_candidates, summary_candidates)
         summary_ranked, summary_best = self._rank_candidates(
@@ -304,7 +312,11 @@ class Memory:
             self._mark_records_retrieved(summary_ranked[:limit], records)
             return summary_ranked[:limit]
 
-        full_candidates = self._merge_unique(self._candidate_pool(include_facts=True), entity_candidates, session_candidates)
+        full_candidates = self._merge_unique(
+            self._candidate_pool(include_facts=True, _records=active_records),
+            entity_candidates,
+            session_candidates,
+        )
         if recent_candidates:
             full_candidates = self._merge_unique(recent_candidates, full_candidates)
         vector_hit_records = (
@@ -324,7 +336,12 @@ class Memory:
             self._mark_records_retrieved(ranked[:limit], records)
             return ranked[:limit]
 
-        fallback_hits, _ = self._fast_recall(query_variants[0], limit, include_facts=True)
+        fallback_hits, _ = self._fast_recall(
+            query_variants[0],
+            limit,
+            include_facts=True,
+            candidates=self._merge_unique(full_candidates, vector_hits),
+        )
         self._mark_records_retrieved(fallback_hits, records)
         return fallback_hits
 
@@ -1023,15 +1040,20 @@ class Memory:
         payload["records"] = records
         payload["updated_at"] = self._now_iso()
         self._save_records_payload(payload)
-        self._rebuild_entities(records)
-        self._rewrite_summary_docs_from_records(records)
         self._semantic_candidate_cache_key = None
         self._semantic_candidate_cache_embeddings = None
         self._query_embedding_cache = {}
-        if stored_records_changed:
-            with contextlib.suppress(OSError):
-                self.index_state_path.unlink()
-            threading.Thread(target=self._safe_ensure_index, daemon=True).start()
+        rebuild_records = [dict(record) if isinstance(record, dict) else record for record in records]
+
+        def _background_rebuild() -> None:
+            self._rebuild_entities(rebuild_records)
+            self._rewrite_summary_docs_from_records(rebuild_records)
+            if stored_records_changed:
+                with contextlib.suppress(OSError):
+                    self.index_state_path.unlink()
+                self._safe_ensure_index()
+
+        threading.Thread(target=_background_rebuild, daemon=True).start()
 
     def _rewrite_summary_docs_from_records(self, records: list[dict[str, Any]]) -> None:
         personal_lines = [
@@ -1181,20 +1203,7 @@ class Memory:
         return " ".join(blended[:2])
 
     def _daily_summary_source_signature(self) -> str:
-        payload = self._load_records_payload()
-        records = payload.get("records", [])
-        if not isinstance(records, list):
-            records = []
-        active_records = [
-            {
-                "id": record.get("id"),
-                "updated_at": record.get("updated_at"),
-                "text": record.get("text"),
-            }
-            for record in records
-            if record.get("active", True)
-        ]
-        return json.dumps(active_records, ensure_ascii=True, sort_keys=True)
+        return str(self._memory_source_state().get("records_digest", ""))
 
     def _match_records_for_forget(
         self,
@@ -1450,8 +1459,14 @@ class Memory:
         overlap = len(query_tokens & candidate_tokens)
         return overlap / math.sqrt(len(query_tokens) * len(candidate_tokens))
 
-    def _fast_recall(self, query: str, limit: int, include_facts: bool) -> tuple[list[str], float]:
-        candidates = self._candidate_pool(include_facts)
+    def _fast_recall(
+        self,
+        query: str,
+        limit: int,
+        include_facts: bool,
+        candidates: list[str] | None = None,
+    ) -> tuple[list[str], float]:
+        candidates = candidates if candidates is not None else self._candidate_pool(include_facts)
         scored: list[tuple[float, str]] = []
         for candidate in candidates:
             score = self._token_overlap_score(query, candidate)
@@ -1463,15 +1478,19 @@ class Memory:
             return [], 0.0
         return [candidate for _, candidate in scored[:limit]], scored[0][0]
 
-    def _query_variants(self, query: str) -> list[str]:
-        normalized = self._normalize_query_against_memory(query)
+    def _query_variants(self, query: str, candidate_records: list[dict[str, Any]] | None = None) -> list[str]:
+        normalized = self._normalize_query_against_memory(query, candidate_records=candidate_records)
         variants = [query.strip()]
         if normalized and normalized not in variants:
             variants.append(normalized)
         return [variant for variant in variants if variant]
 
-    def _normalize_query_against_memory(self, query: str) -> str:
-        vocabulary = self._memory_vocabulary()
+    def _normalize_query_against_memory(
+        self,
+        query: str,
+        candidate_records: list[dict[str, Any]] | None = None,
+    ) -> str:
+        vocabulary = self._memory_vocabulary(candidate_records=candidate_records)
         if not vocabulary:
             return query
 
@@ -1495,10 +1514,10 @@ class Memory:
         normalized = "".join(corrected_tokens).strip()
         return normalized if changed else query
 
-    def _memory_vocabulary(self) -> set[str]:
+    def _memory_vocabulary(self, candidate_records: list[dict[str, Any]] | None = None) -> set[str]:
         vocab: set[str] = set()
         candidates = self._merge_unique(
-            self._candidate_pool(include_facts=True),
+            self._candidate_pool(include_facts=True, _records=candidate_records),
             self._entity_candidates(""),
         )
         for candidate in candidates:
@@ -1534,9 +1553,15 @@ class Memory:
                 merged.append(item)
         return merged
 
-    def _candidate_pool(self, include_facts: bool) -> list[str]:
-        payload = self._load_records_payload()
-        records = payload.get("records", [])
+    def _candidate_pool(
+        self,
+        include_facts: bool,
+        _records: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        records = _records
+        if records is None:
+            payload = self._load_records_payload()
+            records = payload.get("records", [])
         if not isinstance(records, list):
             records = []
         candidates: list[str] = []
@@ -1599,25 +1624,33 @@ class Memory:
             modifiers[text] = max(modifiers.get(text, float("-inf")), modifier)
         return modifiers
 
-    def _mark_records_retrieved(self, matched_texts: list[str], records: list[dict[str, Any]]) -> None:
+    def _mark_records_retrieved(
+        self,
+        matched_texts: list[str],
+        records: list[dict[str, Any]] | None = None,
+    ) -> None:
         text_set = {str(text).strip() for text in matched_texts if str(text).strip()}
         if not text_set:
             return
+        now = self._now_iso()
+        payload = self._load_records_payload()
+        fresh = payload.get("records", [])
+        if not isinstance(fresh, list):
+            return
         touched = False
-        for record in records:
+        for record in fresh:
             text = str(record.get("text", "")).strip()
             if text not in text_set:
                 continue
-            record["last_retrieved_at"] = self._now_iso()
+            record["last_retrieved_at"] = now
             record["retrieval_count"] = int(record.get("retrieval_count", 0)) + 1
             if record.get("demoted"):
                 record["demoted"] = False
             touched = True
         if not touched:
             return
-        payload = self._load_records_payload()
-        payload["records"] = records
-        payload["updated_at"] = self._now_iso()
+        payload["records"] = fresh
+        payload["updated_at"] = now
         self._save_records_payload(payload)
 
     def _recent_session_files(self, limit_files: int = 4) -> list[Path]:
@@ -1664,7 +1697,15 @@ class Memory:
             "worked on",
             "working on",
             "what did we",
+            "what were we",
+            "what was i",
+            "yesterday",
+            "earlier today",
+            "before",
+            "previously",
             "last time",
+            "last session",
+            "recent chat",
             "earlier session",
         )
         if not any(marker in lowered for marker in session_markers):

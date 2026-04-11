@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ class SessionStore:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.sessions_dir / SESSION_INDEX_FILE
         self._lock = threading.Lock()
+        self._recent_candidates_cache: tuple[float, tuple[int, int], list[str]] | None = None
         if not self.index_path.exists():
             self._save_index({"sessions": {}})
         self._migrate_legacy_json_sessions()
@@ -69,6 +71,7 @@ class SessionStore:
             session = self._ensure_session_unlocked(index, session_id)
             self._set_session_name_unlocked(session, cleaned_name, auto_named=False)
             self._save_index(index)
+            self._invalidate_recent_candidates_cache()
             return dict(session)
 
     def maybe_autoname_from_text(self, session_id: str, text: str) -> dict[str, Any] | None:
@@ -117,16 +120,17 @@ class SessionStore:
     ) -> dict[str, Any]:
         tool_trace = tool_trace or []
         turn_meta = turn_meta or {}
+        user_text = str(user_message).strip()
+        assistant_text = str(assistant_message).strip()
+        timestamp = self._now_iso()
+        auto_name_candidate = ""
+
         with self._lock:
             index = self._load_index()
             session = self._ensure_session_unlocked(index, session_id, mode=None)
-
-            user_text = str(user_message).strip()
-            assistant_text = str(assistant_message).strip()
-            if user_text:
-                self._maybe_autoname_unlocked(session, user_text)
-
-            timestamp = self._now_iso()
+            if user_text and session.get("auto_named", True):
+                auto_name_candidate = self._derive_name_from_text(user_text)
+            session_path = self._session_path(session)
             entries: list[dict[str, Any]] = []
             if user_text:
                 entries.append(
@@ -165,11 +169,15 @@ class SessionStore:
                         assistant_entry[key] = value
                 entries.append(assistant_entry)
 
-            session_path = self._session_path(session)
-            with session_path.open("a", encoding="utf-8") as handle:
-                for entry in entries:
-                    handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        with session_path.open("a", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
 
+        with self._lock:
+            index = self._load_index()
+            session = self._ensure_session_unlocked(index, session_id, mode=None)
+            if auto_name_candidate and session.get("auto_named", True):
+                self._set_session_name_unlocked(session, auto_name_candidate, auto_named=True)
             if user_text and not session.get("first_user_message"):
                 session["first_user_message"] = self._truncate(user_text, 240)
             if user_text:
@@ -179,6 +187,7 @@ class SessionStore:
                 session["turn_count"] = int(session.get("turn_count", 0) or 0) + 1
             session["updated_at"] = timestamp
             self._save_index(index)
+            self._invalidate_recent_candidates_cache()
             return dict(session)
 
     def load_messages(self, session_id: str, limit_messages: int = 12) -> list[dict[str, str]]:
@@ -226,6 +235,17 @@ class SessionStore:
         return [session for _, session in matches[: max(1, limit)]]
 
     def recent_session_candidates(self, limit_files: int = 4, max_turns: int = 24) -> list[str]:
+        now = time.time()
+        cache = self._recent_candidates_cache
+        cache_key = (max(1, limit_files), max(1, max_turns))
+        if cache and cache[1] == cache_key and (now - cache[0]) < 30:
+            return list(cache[2])
+
+        candidates = self._build_recent_candidates(*cache_key)
+        self._recent_candidates_cache = (now, cache_key, list(candidates))
+        return candidates
+
+    def _build_recent_candidates(self, limit_files: int, max_turns: int) -> list[str]:
         candidates: list[str] = []
         for session in self.list_sessions(limit=max(1, limit_files)):
             display_name = str(session.get("display_name", "Untitled session")).strip()
@@ -250,6 +270,9 @@ class SessionStore:
                     )
                     pending_user = None
         return candidates[-max(1, max_turns) :]
+
+    def _invalidate_recent_candidates_cache(self) -> None:
+        self._recent_candidates_cache = None
 
     @staticmethod
     def normalize_mode(mode: str | None) -> str:

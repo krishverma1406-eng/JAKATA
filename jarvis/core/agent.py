@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from datetime import datetime
@@ -11,6 +12,7 @@ from typing import Any, Callable
 from config.settings import SETTINGS, Settings
 from core.brain import Brain
 from core.interface_config import INTERFACE_CONFIG
+from core.intent_helpers import explicit_code_writer_request
 from core.memory import Memory
 from core.planner import Planner
 from core.tool_registry import ToolRegistry
@@ -286,6 +288,9 @@ class Agent:
                     }
                 )
 
+            if tool_calls and event_handler is not None and stream_handler is not None:
+                event_handler({"type": "stream_cancelled"})
+
             if not tool_calls:
                 final_answer = self._resolve_final_answer(response, tool_trace)
                 return self._finalize_response(
@@ -436,7 +441,7 @@ class Agent:
         if plan.get("needs_planning"):
             messages.append({"role": "system", "content": self._plan_execution_guidance()})
 
-        messages.extend(self.history[-8:])
+        messages.extend(self.history[-12:])
         messages.append({"role": "user", "content": user_message})
         return messages
 
@@ -557,7 +562,7 @@ class Agent:
 
     def _task_kind(self, user_message: str, plan: dict[str, Any]) -> str:
         lowered = user_message.lower()
-        code_markers = (
+        code_phrases = (
             "build a tool",
             "create a tool",
             "write code",
@@ -565,14 +570,6 @@ class Agent:
             "build a python script",
             "create a python script",
             "python script",
-            "script",
-            "code",
-            "coding",
-            "program",
-            "function",
-            "class",
-            "module",
-            "api",
             "debug",
             "refactor",
             "implement",
@@ -584,9 +581,35 @@ class Agent:
             "unit test",
             "test case",
         )
+        code_terms = (
+            "script",
+            "code",
+            "coding",
+            "program",
+            "function",
+            "class",
+            "module",
+            "api",
+        )
+        code_adjacent = {
+            "write",
+            "create",
+            "build",
+            "fix",
+            "debug",
+            "implement",
+            "generate",
+            "refactor",
+            "test",
+            "compile",
+            "run",
+        }
+        lowered_tokens = set(re.findall(r"[a-z0-9_+.:-]+", lowered))
         if any(step.get("tool_name") == "code_writer" for step in plan.get("steps", [])):
             return "code"
-        if any(marker in lowered for marker in code_markers):
+        if any(marker in lowered for marker in code_phrases):
+            return "code"
+        if any(marker in lowered_tokens for marker in code_terms) and bool(lowered_tokens & code_adjacent):
             return "code"
         if any(extension in lowered for extension in (".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".html", ".css", ".sql", ".sh", ".ps1")):
             return "code"
@@ -668,27 +691,12 @@ class Agent:
             return False
         if "?" in lowered:
             return False
-        if any(
-            lowered.startswith(prefix)
-            for prefix in (
-                "open ",
-                "search ",
-                "play ",
-                "list ",
-                "show ",
-                "tell me",
-                "what ",
-                "who ",
-                "where ",
-                "when ",
-                "why ",
-                "how ",
-                "can you",
-                "could you",
-                "please ",
-                "pls ",
-            )
-        ):
+        command_only_pattern = re.compile(
+            r"^(open|search|play|list|show|find|tell me|what is|how to)\s+"
+            r"(spotify|youtube|chrome|vscode|notepad|calculator|terminal)[\s.!?]*$",
+            re.IGNORECASE,
+        )
+        if command_only_pattern.match(user_message.strip()):
             return False
         extract_markers = (
             "remember ",
@@ -705,7 +713,11 @@ class Agent:
             "i am working on ",
             "my project ",
         )
-        return any(marker in lowered for marker in extract_markers)
+        if any(marker in lowered for marker in extract_markers):
+            return True
+        if "project" in lowered and any(marker in lowered for marker in ("my ", "i am ", "i'm ", "working on ")):
+            return True
+        return False
 
     def _select_tool_definitions(
         self,
@@ -823,13 +835,12 @@ class Agent:
         forced_tools: set[str],
     ) -> int:
         lowered = user_message.lower().strip()
+        word_count = len(lowered.split())
         if forced_tools:
             return max(6, len(forced_tools) + 3)
         if plan.get("needs_planning"):
             return 8
-        if len(lowered.split()) >= 10:
-            return 6
-        return 4
+        return min(4 + (word_count // 5), 7)
 
     def _tool_is_compatible(
         self,
@@ -1212,22 +1223,7 @@ class Agent:
         return forced & available
 
     def _explicit_code_writer_request(self, user_message: str) -> bool:
-        lowered = user_message.lower().strip()
-        explicit_markers = (
-            "create a tool",
-            "build a tool",
-            "new jarvis tool",
-            "make a tool",
-            "write tool code",
-            "generate tool code",
-            "scaffold a tool",
-            "repair tool file",
-            "fix tool file",
-            "code_writer",
-            "tool file",
-            "tool module",
-        )
-        return any(marker in lowered for marker in explicit_markers)
+        return explicit_code_writer_request(user_message)
 
     def _should_answer_code_directly(self, user_message: str) -> bool:
         lowered = user_message.lower().strip()
@@ -1362,7 +1358,10 @@ class Agent:
         last_tool_name = str(tool_trace[-1].get("name", "")).strip() if tool_trace else ""
 
         if any(marker in lowered for marker in raw_tool_markers):
-            return self._resolve_final_answer({"content": ""}, tool_trace)
+            cleaned_summary = self._rewrite_tool_dump_as_answer(cleaned, tool_trace)
+            if cleaned_summary:
+                return cleaned_summary
+            return ""
 
         if (
             last_tool_name == "memory_query"
@@ -1384,6 +1383,39 @@ class Agent:
             return self._summarize_memory_query_result(last_result)
 
         return cleaned
+
+    def _rewrite_tool_dump_as_answer(
+        self,
+        assistant_message: str,
+        tool_trace: list[dict[str, Any]],
+    ) -> str:
+        if not tool_trace:
+            return ""
+
+        latest = tool_trace[-1]
+        tool_name = str(latest.get("name", "")).strip() or "tool"
+        tool_result = latest.get("result", {})
+        prompt = (
+            "Rewrite the assistant draft into a clean final answer for the user.\n"
+            "Use the tool result as the source of truth.\n"
+            "Do not expose raw JSON, internal traces, or debug wording.\n"
+            "If the tool failed, say what failed plainly.\n"
+            "If the tool succeeded, summarize the useful result naturally.\n"
+            "Return only the cleaned answer.\n\n"
+            f"Tool name: {tool_name}\n"
+            f"Tool result: {json.dumps(tool_result, ensure_ascii=True, default=str)}\n"
+            f"Draft assistant message: {assistant_message}\n"
+        )
+        try:
+            response = self.brain.chat(
+                messages=[{"role": "user", "content": prompt}],
+                tools=[],
+                task_kind="simple",
+                system_override="You are JARVIS. Return only the cleaned final answer.",
+            )
+        except Exception:
+            return ""
+        return str(response.get("content", "")).strip()
 
     def _summarize_memory_query_result(self, result: dict[str, Any]) -> str:
         if result.get("ok") is False:
@@ -1424,8 +1456,15 @@ class Agent:
         return "Memory lookup completed."
 
     def _remember_turn(self, user_message: str, assistant_message: str) -> None:
-        self.history.append({"role": "user", "content": user_message})
-        self.history.append({"role": "assistant", "content": assistant_message})
+        if not (
+            len(self.history) >= 2
+            and self.history[-2].get("role") == "user"
+            and self.history[-2].get("content") == user_message
+            and self.history[-1].get("role") == "assistant"
+            and self.history[-1].get("content") == assistant_message
+        ):
+            self.history.append({"role": "user", "content": user_message})
+            self.history.append({"role": "assistant", "content": assistant_message})
         self.history = self.history[-16:]
 
     def _finalize_response(

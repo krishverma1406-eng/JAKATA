@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -29,6 +30,9 @@ class ToolRegistry:
         self._definitions: dict[str, dict[str, Any]] = {}
         self._executors: dict[str, Callable[[dict[str, Any]], Any]] = {}
         self._errors: dict[str, str] = {}
+        self._tool_paths: dict[str, str] = {}
+        self._path_to_tool_name: dict[str, str] = {}
+        self._path_to_module_name: dict[str, str] = {}
         self.refresh(force=True)
 
     def refresh(self, force: bool = False) -> None:
@@ -36,21 +40,29 @@ class ToolRegistry:
         if not force and signature == self._last_signature and (time.time() - self._last_scan) < self.reload_interval:
             return
 
-        self._definitions.clear()
-        self._executors.clear()
-        self._errors.clear()
-
         if not self.tools_dir.exists():
+            for path_name in list(self._path_to_tool_name):
+                self._unload_tool_path(path_name)
             self._last_scan = time.time()
+            self._last_signature = ()
             return
 
-        for path in sorted(self.tools_dir.glob("*.py")):
-            if path.name == "__init__.py":
+        old_sig_map = dict(self._last_signature)
+        new_sig_map = dict(signature)
+
+        for path_name in list(self._path_to_tool_name):
+            if path_name not in new_sig_map:
+                self._unload_tool_path(path_name)
+
+        for path_name, _mtime in new_sig_map.items():
+            if not force and old_sig_map.get(path_name) == new_sig_map[path_name]:
                 continue
+            path = self.tools_dir / path_name
+            self._unload_tool_path(path_name)
             try:
                 self._load_tool(path)
             except Exception as exc:
-                self._errors[path.stem] = str(exc)
+                self._errors[Path(path_name).stem] = str(exc)
 
         self._last_scan = time.time()
         self._last_signature = signature
@@ -132,13 +144,20 @@ class ToolRegistry:
         return str(best_definition["name"])
 
     def _load_tool(self, path: Path) -> None:
-        module_name = f"jarvis_tool_{path.stem}_{path.stat().st_mtime_ns}"
+        module_name = f"jarvis_tool_{path.stem}"
+        if module_name in sys.modules:
+            del sys.modules[module_name]
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Unable to load module from {path}")
 
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
 
         definition = getattr(module, "TOOL_DEFINITION", None)
         execute = getattr(module, "execute", None)
@@ -157,12 +176,33 @@ class ToolRegistry:
         if not isinstance(parameters, dict) or parameters.get("type") != "object":
             raise RuntimeError("Tool parameters must be a JSON-schema object.")
 
+        previous_path = self._tool_paths.get(name)
+        if previous_path and previous_path != path.name:
+            self._unload_tool_path(previous_path)
+
         self._definitions[name] = {
             "name": name,
             "description": description,
             "parameters": parameters,
         }
         self._executors[name] = execute
+        self._tool_paths[name] = path.name
+        self._path_to_tool_name[path.name] = name
+        self._path_to_module_name[path.name] = module_name
+        self._errors.pop(name, None)
+        self._errors.pop(path.stem, None)
+
+    def _unload_tool_path(self, path_name: str) -> None:
+        tool_name = self._path_to_tool_name.pop(path_name, None)
+        if tool_name:
+            self._definitions.pop(tool_name, None)
+            self._executors.pop(tool_name, None)
+            self._tool_paths.pop(tool_name, None)
+            self._errors.pop(tool_name, None)
+        module_name = self._path_to_module_name.pop(path_name, None)
+        if module_name:
+            sys.modules.pop(module_name, None)
+        self._errors.pop(Path(path_name).stem, None)
 
     @staticmethod
     def _score_tool_definition(

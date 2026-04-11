@@ -35,58 +35,71 @@ class Brain:
     ) -> dict[str, Any]:
         """Call live providers and normalize their response."""
 
-        system_prompt, compiled_messages = self._compile_messages(
+        system_messages, compiled_messages = self._compile_messages(
             messages,
             system_override,
             tool_definitions=tools or [],
         )
 
-        heuristic_response = self._offline_tool_response(compiled_messages, tools or [])
-        if heuristic_response is not None:
-            return heuristic_response
-
         provider_errors: list[str] = []
         try:
-            return self._call_nvidia(
-                system_prompt,
+            response = self._call_nvidia(
+                system_messages,
                 compiled_messages,
                 tools or [],
                 task_kind,
                 response_format,
                 stream_handler,
             )
+            if self._response_has_payload(response):
+                return response
+            provider_errors.append("nvidia: empty response")
         except Exception as exc:  # pragma: no cover - depends on auth/network
             provider_errors.append(f"nvidia: {exc}")
 
         try:
-            return self._call_groq(
-                system_prompt,
+            response = self._call_groq(
+                system_messages,
                 compiled_messages,
                 tools or [],
                 task_kind,
                 response_format,
                 stream_handler,
             )
+            if self._response_has_payload(response):
+                return response
+            provider_errors.append("groq: empty response")
         except Exception as exc:  # pragma: no cover - depends on auth/network
             provider_errors.append(f"groq: {exc}")
 
         try:
-            return self._call_openrouter(
-                system_prompt,
+            response = self._call_openrouter(
+                system_messages,
                 compiled_messages,
                 tools or [],
                 task_kind,
                 response_format,
                 stream_handler,
             )
+            if self._response_has_payload(response):
+                return response
+            provider_errors.append("openrouter: empty response")
         except Exception as exc:  # pragma: no cover - depends on auth/network
             provider_errors.append(f"openrouter: {exc}")
 
         return self._offline_response(compiled_messages, tools or [], provider_errors)
 
+    @staticmethod
+    def _response_has_payload(response: dict[str, Any] | None) -> bool:
+        if not isinstance(response, dict):
+            return False
+        content = str(response.get("content", "")).strip()
+        tool_calls = response.get("tool_calls", [])
+        return bool(content or tool_calls)
+
     def _call_groq(
         self,
-        system_prompt: str,
+        system_messages: list[str],
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         task_kind: str,
@@ -99,7 +112,7 @@ class Brain:
 
         payload: dict[str, Any] = {
             "model": self._groq_model_for(task_kind),
-            "messages": self._to_openai_messages(system_prompt, messages),
+            "messages": self._to_openai_messages(system_messages, messages),
             "temperature": 0.2,
             "max_tokens": 4096,
         }
@@ -147,7 +160,7 @@ class Brain:
         messages: list[dict[str, Any]],
         system_override: str | None,
         tool_definitions: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]]]:
+    ) -> tuple[list[str], list[dict[str, Any]]]:
         include_tooling = bool(tool_definitions) or any(message.get("role") == "tool" for message in messages)
         effective_tools = tool_definitions if include_tooling else []
         system_parts = [system_override or self.build_system_prompt_for_context(effective_tools)]
@@ -163,8 +176,8 @@ class Brain:
             normalized["content"] = self._stringify_content(message.get("content", ""))
             compiled_messages.append(normalized)
 
-        system_prompt = "\n\n".join(part for part in system_parts if part).strip()
-        return system_prompt, compiled_messages
+        system_messages = [part.strip() for part in system_parts if part and part.strip()]
+        return system_messages, compiled_messages
 
     def build_system_prompt_for_context(self, tool_definitions: list[dict[str, Any]]) -> str:
         base_prompt = self.build_system_prompt()
@@ -178,7 +191,7 @@ class Brain:
 
     def _call_nvidia(
         self,
-        system_prompt: str,
+        system_messages: list[str],
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         task_kind: str,
@@ -192,7 +205,7 @@ class Brain:
         model_name = self._nvidia_model_for(task_kind)
         payload: dict[str, Any] = {
             "model": model_name,
-            "messages": self._to_openai_messages(system_prompt, messages),
+            "messages": self._to_openai_messages(system_messages, messages),
             "temperature": 0.6,
             "top_p": 0.95,
             "max_tokens": 4096,
@@ -213,66 +226,18 @@ class Brain:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        url = f"{self.settings.nvidia_base_url.rstrip('/')}/chat/completions"
-        if stream_handler is not None:
-            streamed = self._post_json_stream_requests(url, payload, headers, self.settings.nvidia_timeout_seconds, stream_handler)
-            if not streamed.get("content") and not streamed.get("tool_calls"):
-                raw = self._post_json_requests(url, payload, headers, self.settings.nvidia_timeout_seconds)
-                message = raw["choices"][0]["message"]
-                tool_calls = [
-                    {
-                        "id": call.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                        "name": call["function"]["name"],
-                        "arguments": self._safe_json(call["function"].get("arguments", "{}")),
-                    }
-                    for call in message.get("tool_calls", [])
-                ]
-                content = self._stringify_content(message.get("content", ""))
-                embedded_tool_calls, cleaned_content = self._extract_embedded_tool_calls(content)
-                if embedded_tool_calls:
-                    tool_calls.extend(embedded_tool_calls)
-                    content = cleaned_content
-                return {
-                    "provider": "nvidia",
-                    "model": raw.get("model", payload["model"]),
-                    "content": content,
-                    "tool_calls": tool_calls,
-                    "raw": raw,
-                }
-            return {
-                "provider": "nvidia",
-                "model": streamed.get("model") or payload["model"],
-                "content": self._stringify_content(streamed.get("content", "")),
-                "tool_calls": streamed.get("tool_calls", []),
-                "raw": streamed.get("raw", {}),
-            }
-
-        raw = self._post_json_requests(url, payload, headers, self.settings.nvidia_timeout_seconds)
-        message = raw["choices"][0]["message"]
-        tool_calls = [
-            {
-                "id": call.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                "name": call["function"]["name"],
-                "arguments": self._safe_json(call["function"].get("arguments", "{}")),
-            }
-            for call in message.get("tool_calls", [])
-        ]
-        content = self._stringify_content(message.get("content", ""))
-        embedded_tool_calls, cleaned_content = self._extract_embedded_tool_calls(content)
-        if embedded_tool_calls:
-            tool_calls.extend(embedded_tool_calls)
-            content = cleaned_content
-        return {
-            "provider": "nvidia",
-            "model": raw.get("model", payload["model"]),
-            "content": content,
-            "tool_calls": tool_calls,
-            "raw": raw,
-        }
+        return self._call_openai_compatible(
+            url=f"{self.settings.nvidia_base_url.rstrip('/')}/chat/completions",
+            payload=payload,
+            headers=headers,
+            timeout=self.settings.nvidia_timeout_seconds,
+            provider="nvidia",
+            stream_handler=stream_handler,
+        )
 
     def _call_openrouter(
         self,
-        system_prompt: str,
+        system_messages: list[str],
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         task_kind: str,
@@ -285,7 +250,7 @@ class Brain:
 
         payload: dict[str, Any] = {
             "model": self._openrouter_model_for(task_kind),
-            "messages": self._to_openai_messages(system_prompt, messages),
+            "messages": self._to_openai_messages(system_messages, messages),
             "temperature": 0.2,
         }
         if tools:
@@ -326,27 +291,7 @@ class Brain:
             streamed = self._post_json_stream_requests(url, payload, headers, timeout, stream_handler)
             if not streamed.get("content") and not streamed.get("tool_calls"):
                 raw = self._post_json_requests(url, payload, headers, timeout)
-                message = raw["choices"][0]["message"]
-                tool_calls = [
-                    {
-                        "id": call.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                        "name": call["function"]["name"],
-                        "arguments": self._safe_json(call["function"].get("arguments", "{}")),
-                    }
-                    for call in message.get("tool_calls", [])
-                ]
-                content = self._stringify_content(message.get("content", ""))
-                embedded_tool_calls, cleaned_content = self._extract_embedded_tool_calls(content)
-                if embedded_tool_calls:
-                    tool_calls.extend(embedded_tool_calls)
-                    content = cleaned_content
-                return {
-                    "provider": provider,
-                    "model": raw.get("model", payload["model"]),
-                    "content": content,
-                    "tool_calls": tool_calls,
-                    "raw": raw,
-                }
+                return self._response_from_raw(provider, payload, raw)
             return {
                 "provider": provider,
                 "model": streamed.get("model") or payload["model"],
@@ -356,27 +301,7 @@ class Brain:
             }
 
         raw = self._post_json_requests(url, payload, headers, timeout)
-        message = raw["choices"][0]["message"]
-        tool_calls = [
-            {
-                "id": call.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                "name": call["function"]["name"],
-                "arguments": self._safe_json(call["function"].get("arguments", "{}")),
-            }
-            for call in message.get("tool_calls", [])
-        ]
-        content = self._stringify_content(message.get("content", ""))
-        embedded_tool_calls, cleaned_content = self._extract_embedded_tool_calls(content)
-        if embedded_tool_calls:
-            tool_calls.extend(embedded_tool_calls)
-            content = cleaned_content
-        return {
-            "provider": provider,
-            "model": raw.get("model", payload["model"]),
-            "content": content,
-            "tool_calls": tool_calls,
-            "raw": raw,
-        }
+        return self._response_from_raw(provider, payload, raw)
 
     def _offline_response(
         self,
@@ -488,12 +413,13 @@ class Brain:
 
     def _to_openai_messages(
         self,
-        system_prompt: str,
+        system_messages: list[str],
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         openai_messages: list[dict[str, Any]] = []
-        if system_prompt:
-            openai_messages.append({"role": "system", "content": system_prompt})
+        for system_message in system_messages:
+            if system_message:
+                openai_messages.append({"role": "system", "content": system_message})
 
         for message in messages:
             role = message.get("role", "user")
@@ -519,8 +445,12 @@ class Brain:
 
             openai_message = {"role": role, "content": message.get("content", "")}
             if role == "tool":
-                openai_message["tool_call_id"] = message.get("tool_call_id")
-                openai_message["name"] = message.get("name")
+                tc_id = message.get("tool_call_id")
+                name = message.get("name")
+                if tc_id is not None:
+                    openai_message["tool_call_id"] = tc_id
+                if name is not None:
+                    openai_message["name"] = name
             openai_messages.append(openai_message)
 
         return openai_messages
@@ -645,7 +575,7 @@ class Brain:
             {
                 "id": tool_call["id"] or f"call_{uuid.uuid4().hex[:8]}",
                 "name": tool_call["name"],
-                "arguments": self._safe_json(tool_call["arguments_text"] or "{}"),
+                "arguments": self._safe_json(tool_call["arguments_text"] or "{}") or {},
             }
             for _, tool_call in sorted(tool_calls_by_index.items())
             if tool_call["name"]
@@ -674,6 +604,37 @@ class Brain:
             return json.loads(text)
         except json.JSONDecodeError:
             return None
+
+    def _tool_calls_from_message(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": call.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                "name": call["function"]["name"],
+                "arguments": self._safe_json(call["function"].get("arguments", "{}")) or {},
+            }
+            for call in message.get("tool_calls", [])
+        ]
+
+    def _response_from_raw(
+        self,
+        provider: str,
+        payload: dict[str, Any],
+        raw: dict[str, Any],
+    ) -> dict[str, Any]:
+        message = raw["choices"][0]["message"]
+        tool_calls = self._tool_calls_from_message(message)
+        content = self._stringify_content(message.get("content", ""))
+        embedded_tool_calls, cleaned_content = self._extract_embedded_tool_calls(content)
+        if embedded_tool_calls:
+            tool_calls.extend(embedded_tool_calls)
+            content = cleaned_content
+        return {
+            "provider": provider,
+            "model": raw.get("model", payload["model"]),
+            "content": content,
+            "tool_calls": tool_calls,
+            "raw": raw,
+        }
 
     def _extract_embedded_tool_calls(self, content: str) -> tuple[list[dict[str, Any]], str]:
         if not content:

@@ -43,33 +43,34 @@ class BrowserAutomationService:
 
     def run(self, action: str, params: dict[str, Any], session_id: str = "default") -> dict[str, Any]:
         action_name = action.strip().lower()
-        session_key = self._session_key(session_id)
         with self._lock:
-            try:
-                handlers = {
-                    "status": self.status,
-                    "open": self.open_page,
-                    "fetch": self.fetch_page,
-                    "click": self.click,
-                    "type": self.type_into,
-                    "extract": self.extract_text,
-                    "screenshot": self.capture_screenshot,
-                    "scroll": self.scroll,
-                    "wait": self.wait_for,
-                    "evaluate": self.evaluate,
-                    "fill_form": self.fill_form,
-                    "act": self.act,
-                }
-                handler = handlers.get(action_name)
-                if handler is None:
-                    raise BrowserAutomationError(f"Unsupported browser action: {action}")
-                return handler(params, session_key)
-            except BrowserAutomationError:
-                raise
-            except NovaActError as exc:
-                raise BrowserAutomationError(str(exc)) from exc
-            except Exception as exc:
-                raise BrowserAutomationError(str(exc)) from exc
+            session_key = self._session_key(session_id)
+            handlers = {
+                "status": self.status,
+                "open": self.open_page,
+                "fetch": self.fetch_page,
+                "click": self.click,
+                "type": self.type_into,
+                "extract": self.extract_text,
+                "screenshot": self.capture_screenshot,
+                "scroll": self.scroll,
+                "wait": self.wait_for,
+                "evaluate": self.evaluate,
+                "fill_form": self.fill_form,
+                "act": self.act,
+            }
+            handler = handlers.get(action_name)
+
+        if handler is None:
+            raise BrowserAutomationError(f"Unsupported browser action: {action}")
+        try:
+            return handler(params, session_key)
+        except BrowserAutomationError:
+            raise
+        except NovaActError as exc:
+            raise BrowserAutomationError(str(exc)) from exc
+        except Exception as exc:
+            raise BrowserAutomationError(str(exc)) from exc
 
     def close(self) -> None:
         with self._lock:
@@ -338,8 +339,14 @@ class BrowserAutomationService:
 
     def _quiet_call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-            return fn(*args, **kwargs)
+        try:
+            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+                return fn(*args, **kwargs)
+        except Exception:
+            captured = buffer.getvalue().strip()
+            if captured:
+                logging.getLogger("jarvis.browser").debug("Nova Act: %s", captured[:1000])
+            raise
 
     def _silence_nova_logging(self) -> None:
         for logger_name in (

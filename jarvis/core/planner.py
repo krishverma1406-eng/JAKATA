@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from core.brain import Brain
+from core.intent_helpers import explicit_code_writer_request
 from core.tool_registry import ToolRegistry
 
 
@@ -29,13 +30,13 @@ class Planner:
         " then ",
         " after ",
         " after that ",
-        " before ",
         " also ",
         " while ",
         " once ",
         " when done ",
         " followed by ",
     )
+    _STRONG_SEQUENCE_MARKERS = tuple(marker for marker in _MULTI_STEP_MARKERS if marker != " and ")
     _ACTION_MARKERS = {
         "open",
         "launch",
@@ -118,7 +119,7 @@ class Planner:
                 {"role": "user", "content": f"Available tools: {tool_list}"},
                 {"role": "user", "content": task},
             ],
-            task_kind="planning",
+            task_kind="simple",
             response_format="json",
             system_override=planner_prompt,
         )
@@ -201,15 +202,18 @@ class Planner:
         task: str,
         tool_definitions: list[dict[str, Any]],
     ) -> bool:
-        lowered = task.lower()
         word_count = len(task.split())
-        marker_hits = sum(1 for marker in self._MULTI_STEP_MARKERS if marker in lowered)
+        marker_hits = self._multi_step_marker_hits(task)
+        strong_marker_hits = self._strong_sequence_marker_hits(task)
         action_count = self._estimated_action_count(task)
         likely_tool_count = len(self._likely_tool_names(task, tool_definitions))
         return (
-            marker_hits > 0
-            or action_count >= 2
+            strong_marker_hits > 0
             or likely_tool_count >= 2
+            or (
+                marker_hits > 0
+                and word_count >= self.brain.settings.planner_simple_word_limit
+            )
             or (
                 word_count >= self.brain.settings.planner_complex_word_limit
                 and (action_count >= 2 or likely_tool_count >= 1)
@@ -232,7 +236,7 @@ class Planner:
         lowered = task.lower().strip()
         if not lowered:
             return True
-        if any(marker in lowered for marker in self._MULTI_STEP_MARKERS):
+        if self._strong_sequence_marker_hits(task) > 0:
             return False
         action_count = self._estimated_action_count(task)
         likely_tool_count = len(self._likely_tool_names(task, tool_definitions))
@@ -245,7 +249,7 @@ class Planner:
         task: str,
         tool_definitions: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        fragments = re.split(r"\b(?:and then|then|after that|and|after|before)\b", task, flags=re.IGNORECASE)
+        fragments = re.split(r"\b(?:and then|then|after that|and|after)\b", task, flags=re.IGNORECASE)
         steps = []
         for fragment in fragments:
             cleaned = fragment.strip(" ,.")
@@ -291,22 +295,7 @@ class Planner:
         return selected
 
     def _explicit_code_writer_request(self, fragment: str) -> bool:
-        lowered = str(fragment or "").lower().strip()
-        explicit_markers = (
-            "create a tool",
-            "build a tool",
-            "new jarvis tool",
-            "make a tool",
-            "write tool code",
-            "generate tool code",
-            "scaffold a tool",
-            "repair tool file",
-            "fix tool file",
-            "code_writer",
-            "tool file",
-            "tool module",
-        )
-        return any(marker in lowered for marker in explicit_markers)
+        return explicit_code_writer_request(fragment)
 
     def _likely_tool_names(
         self,
@@ -320,8 +309,26 @@ class Planner:
         if not tokens:
             return 0
         action_hits = {token for token in tokens if token in self._ACTION_MARKERS}
-        connector_hits = sum(1 for marker in self._MULTI_STEP_MARKERS if marker in f" {task.lower()} ")
+        connector_hits = self._multi_step_marker_hits(task)
         return max(len(action_hits), connector_hits + 1 if connector_hits else len(action_hits))
+
+    def _multi_step_marker_hits(self, task: str) -> int:
+        return self._strong_sequence_marker_hits(task) + int(self._has_multi_action_and(task))
+
+    def _strong_sequence_marker_hits(self, task: str) -> int:
+        lowered = f" {task.lower()} "
+        return sum(1 for marker in self._STRONG_SEQUENCE_MARKERS if marker in lowered)
+
+    def _has_multi_action_and(self, task: str) -> bool:
+        lowered = f" {task.lower()} "
+        if " and " not in lowered:
+            return False
+        parts = [part.strip() for part in lowered.split(" and ") if part.strip()]
+        return len(parts) >= 2 and all(self._fragment_has_action_marker(part) for part in parts)
+
+    def _fragment_has_action_marker(self, fragment: str) -> bool:
+        tokens = re.findall(r"[a-z0-9]+", fragment.lower())
+        return any(token in self._ACTION_MARKERS for token in tokens)
 
     def _normalize_tool_names(
         self,

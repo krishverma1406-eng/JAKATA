@@ -213,6 +213,7 @@ def _build_stream(request: ChatRequest) -> Any:
 
     def event_stream() -> Any:
         event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        abort = threading.Event()
         started_at = time.perf_counter()
         first_chunk_at: float | None = None
         streamed_any = False
@@ -220,11 +221,18 @@ def _build_stream(request: ChatRequest) -> Any:
         stream_started_emitted = False
         current_route = "chat"
 
+        def ensure_connected() -> None:
+            if abort.is_set():
+                raise RuntimeError("Client disconnected")
+
         def emit(payload: dict[str, Any]) -> None:
+            if abort.is_set():
+                return
             event_queue.put(payload)
 
         def stream_handler(chunk: str) -> None:
             nonlocal first_chunk_at, streamed_any, route_emitted, stream_started_emitted, current_route
+            ensure_connected()
             if not chunk:
                 return
             streamed_any = True
@@ -249,11 +257,15 @@ def _build_stream(request: ChatRequest) -> Any:
 
         def event_handler(event: dict[str, Any]) -> None:
             nonlocal route_emitted, stream_started_emitted, current_route
+            ensure_connected()
             event_type = event.get("type")
             if event_type == "activity":
                 payload = event.get("payload", {})
                 if isinstance(payload, dict):
                     emit({"activity": payload})
+                return
+            if event_type == "stream_cancelled":
+                emit({"stream_cancelled": True})
                 return
             tool_name = str(event.get("name", "")).strip()
             arguments = event.get("arguments", {})
@@ -320,16 +332,21 @@ def _build_stream(request: ChatRequest) -> Any:
 
         def worker() -> None:
             try:
+                ensure_connected()
                 emit({"session_id": session_id, "session": _session_payload(agent)})
                 for startup_message in agent.startup_messages():
+                    ensure_connected()
                     emit({"startup_message": startup_message, "session": _session_payload(agent)})
+                ensure_connected()
                 emit({"activity": {"event": "query_detected", "message": message}})
 
                 response_text = agent.run(
                     message,
+                    stream_handler=stream_handler,
                     event_handler=event_handler,
                     runtime_context={"imgbase64": request.imgbase64 or ""},
                 )
+                ensure_connected()
                 if not streamed_any and response_text:
                     if not route_emitted:
                         emit({"activity": {"event": "routing", "route": current_route}})
@@ -337,26 +354,32 @@ def _build_stream(request: ChatRequest) -> Any:
                         emit({"activity": {"event": "streaming_started", "route": current_route}})
                     emit({"activity": {"event": "first_chunk", "route": current_route, "elapsed_ms": int((time.perf_counter() - started_at) * 1000)}})
                     emit({"chunk": response_text})
-                if request.tts:
+                if request.tts and agent.settings.tts_enabled:
                     try:
                         audio = synthesize_base64_sync(response_text, agent.settings)
                     except Exception:
                         audio = None
                     if audio:
+                        ensure_connected()
                         emit({"audio": audio})
+                ensure_connected()
                 emit({"done": True, "session_id": session_id, "session": _session_payload(agent)})
             except Exception as exc:
-                emit({"error": str(exc), "done": True, "session_id": session_id, "session": _session_payload(agent)})
+                if not abort.is_set():
+                    emit({"error": str(exc), "done": True, "session_id": session_id, "session": _session_payload(agent)})
             finally:
                 event_queue.put(None)
 
         threading.Thread(target=worker, daemon=True).start()
 
-        while True:
-            item = event_queue.get()
-            if item is None:
-                break
-            yield _emit_sse(item)
+        try:
+            while True:
+                item = event_queue.get()
+                if item is None:
+                    break
+                yield _emit_sse(item)
+        finally:
+            abort.set()
 
     return event_stream()
 

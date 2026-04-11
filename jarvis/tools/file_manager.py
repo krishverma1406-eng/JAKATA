@@ -38,6 +38,7 @@ _TEXT_EXTENSIONS = {
     ".yml",
 }
 _READ_CHAR_LIMIT = 4000
+_MAX_FILES_TO_SCAN = 500
 
 TOOL_DEFINITION = {
     "name": "file_manager",
@@ -127,7 +128,7 @@ TOOL_DEFINITION = {
 def execute(params: dict[str, Any]) -> dict[str, Any]:
     action = str(params.get("action", "")).strip().lower()
     path_value = str(params.get("path", ".")).strip() or "."
-    target = _resolve_path(path_value)
+    target = _resolve_path(path_value, params)
     recursive = bool(params.get("recursive", True))
     max_results = max(1, min(int(params.get("max_results", 25) or 25), 250))
     summarize = bool(params.get("summarize", True))
@@ -226,6 +227,11 @@ def _read_file(target: Path, summarize: bool) -> dict[str, Any]:
         }
 
     summary, final_content, truncated = _summarize_if_needed(content, summarize)
+    if truncated:
+        final_content += (
+            f"\n\n[FILE TRUNCATED - showing first {_READ_CHAR_LIMIT} of {len(content)} chars. "
+            "Use read with summarize=False and a specific range if you need more.]"
+        )
     return {
         "ok": True,
         "path": str(target),
@@ -317,8 +323,14 @@ def _search_text(
     file_iter = _iter_candidate_files(target, search_root, recursive=recursive)
     matches: list[dict[str, Any]] = []
     normalized_query = query if case_sensitive else query.lower()
+    files_scanned = 0
+    scan_limited = False
 
     for path in file_iter:
+        if files_scanned >= _MAX_FILES_TO_SCAN:
+            scan_limited = True
+            break
+        files_scanned += 1
         if not include_hidden and _is_hidden(path, root=search_root):
             continue
         if pattern and not _path_matches_pattern(path, pattern):
@@ -343,9 +355,23 @@ def _search_text(
                 }
             )
             if len(matches) >= max_results:
-                return {"ok": True, "path": str(search_root), "query": query, "matches": matches}
+                return {
+                    "ok": True,
+                    "path": str(search_root),
+                    "query": query,
+                    "matches": matches,
+                    "files_scanned": files_scanned,
+                    "scan_limited": scan_limited,
+                }
 
-    return {"ok": True, "path": str(search_root), "query": query, "matches": matches}
+    return {
+        "ok": True,
+        "path": str(search_root),
+        "query": query,
+        "matches": matches,
+        "files_scanned": files_scanned,
+        "scan_limited": scan_limited,
+    }
 
 
 def _watch_path(target: Path, recursive: bool, max_results: int, include_hidden: bool) -> dict[str, Any]:
@@ -404,7 +430,7 @@ def _copy_path(target: Path, params: dict[str, Any]) -> dict[str, Any]:
     if not target.exists():
         return {"ok": False, "error": f"Source path does not exist: {target}"}
 
-    destination = _resolve_path(destination_value)
+    destination = _resolve_path(destination_value, params)
     allow_overwrite = bool(params.get("allow_overwrite", False))
 
     if destination.exists() and not allow_overwrite:
@@ -431,7 +457,7 @@ def _move_path(target: Path, params: dict[str, Any]) -> dict[str, Any]:
     if not target.exists():
         return {"ok": False, "error": f"Source path does not exist: {target}"}
 
-    destination = _resolve_path(destination_value)
+    destination = _resolve_path(destination_value, params)
     allow_overwrite = bool(params.get("allow_overwrite", False))
     confirm_destructive = bool(params.get("confirm_destructive", False))
 
@@ -535,10 +561,20 @@ def _summarize_if_needed(content: str, summarize: bool) -> tuple[str, str, bool]
     return "\n".join(summary_lines), normalized[:_READ_CHAR_LIMIT], True
 
 
-def _resolve_path(path_value: str) -> Path:
+def _resolve_path(path_value: str, params: dict[str, Any] | None = None) -> Path:
     candidate = Path(path_value)
     if candidate.is_absolute():
         return candidate.resolve()
+    runtime_context = params.get("_runtime_context", {}) if isinstance(params, dict) else {}
+    if isinstance(runtime_context, dict):
+        runtime_cwd = str(runtime_context.get("cwd", "")).strip()
+        if runtime_cwd:
+            cwd_candidate = (Path(runtime_cwd) / candidate).resolve()
+            if cwd_candidate.exists():
+                return cwd_candidate
+    cwd_candidate = (Path.cwd() / candidate).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
     return (BASE_DIR / candidate).resolve()
 
 
@@ -571,10 +607,14 @@ def _is_hidden(path: Path, root: Path) -> bool:
     return any(part.startswith(".") for part in parts if part not in (".", ".."))
 
 
-def _iter_candidate_files(target: Path, search_root: Path, recursive: bool) -> list[Path]:
+def _iter_candidate_files(target: Path, search_root: Path, recursive: bool):
     if target.exists() and target.is_file():
-        return [target]
-    return [path for path in (search_root.rglob("*") if recursive else search_root.iterdir()) if path.is_file()]
+        yield target
+        return
+    iterator = search_root.rglob("*") if recursive else search_root.iterdir()
+    for path in iterator:
+        if path.is_file():
+            yield path
 
 
 def _path_matches_pattern(path: Path, pattern: str) -> bool:

@@ -899,6 +899,18 @@ async function sendMessageWithImage(text, imgBase64) {
                         if (activityToggle) activityToggle.style.display = '';
                         if (activityPanel && settings.autoOpenActivity) { activityPanel.classList.add('open'); updatePanelOverlay(); }
                     }
+                    if (data.stream_cancelled) {
+                        fullResponse = '';
+                        const textSpan = contentEl.querySelector('.msg-stream-text');
+                        if (textSpan) {
+                            textSpan.textContent = '';
+                            textSpan.classList.add('stream-placeholder');
+                        }
+                        if (cursorEl) {
+                            cursorEl.remove();
+                            cursorEl = null;
+                        }
+                    }
                     if (data.actions) handleActions(data.actions, contentEl);
                     if (data.background_tasks) handleBackgroundTasks(data.background_tasks, contentEl);
                     if ('chunk' in data) {
@@ -1585,6 +1597,18 @@ async function sendMessage(textOverride) {
                         appendActivity(data.activity);
                         if (activityToggle) activityToggle.style.display = '';
                         if (activityPanel && settings.autoOpenActivity) { activityPanel.classList.add('open'); updatePanelOverlay(); }
+                    }
+                    if (data.stream_cancelled) {
+                        fullResponse = '';
+                        const textSpan = contentEl.querySelector('.msg-stream-text');
+                        if (textSpan) {
+                            textSpan.textContent = '';
+                            textSpan.classList.add('stream-placeholder');
+                        }
+                        if (cursorEl) {
+                            cursorEl.remove();
+                            cursorEl = null;
+                        }
                     }
                     if (data.search_results) {
                         renderSearchResults(data.search_results);

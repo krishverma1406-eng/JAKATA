@@ -23,6 +23,10 @@ let recognition = null;
 let ttsPlayer = null;
 let proactiveStream = null;
 let proactiveSessionId = null;
+const proactiveQueue = [];
+let processingProactive = false;
+let activeTaskTimerHandle = null;
+let activeTaskTimerItem = null;
 const SETTINGS_KEY = 'jarvis_settings';
 const DEFAULT_SETTINGS = { autoOpenActivity: true, autoOpenSearchResults: true, voiceInterrupt: true };
 let settings = { ...DEFAULT_SETTINGS };
@@ -280,11 +284,27 @@ function connectProactiveStream(id) {
 }
 
 async function handleProactiveMessage(data) {
-    if (isStreaming) {
-        setTimeout(() => handleProactiveMessage(data), 3000);
-        return;
-    }
+    proactiveQueue.push(data);
+    if (processingProactive) return;
+    await processProactiveQueue();
+}
 
+async function processProactiveQueue() {
+    processingProactive = true;
+    while (proactiveQueue.length > 0) {
+        if (isStreaming) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            continue;
+        }
+        const data = proactiveQueue.shift();
+        if (!data) continue;
+        await renderProactiveMessage(data);
+        await new Promise(resolve => setTimeout(resolve, 800));
+    }
+    processingProactive = false;
+}
+
+async function renderProactiveMessage(data) {
     addTypingIndicator();
     await new Promise(resolve => setTimeout(resolve, 800 + Math.random() * 400));
     removeTypingIndicator();
@@ -1142,10 +1162,21 @@ async function changeMode(mode) {
 
 async function newChat() {
     if (ttsPlayer) ttsPlayer.stop();
+    autoListenMode = false;
+    speechErrorRetryCount = 0;
+    if (micBtn) micBtn.classList.remove('auto-listen', 'listening');
+    if (isListening) stopListening();
     if (camStream) stopCamera();
     if (proactiveStream) proactiveStream.close();
     proactiveStream = null;
     proactiveSessionId = null;
+    if (activeTaskTimerHandle) {
+        clearInterval(activeTaskTimerHandle);
+        activeTaskTimerHandle = null;
+        activeTaskTimerItem = null;
+    }
+    proactiveQueue.length = 0;
+    processingProactive = false;
     sessionId = null;
     sessionMeta = null;
     if (chatMessages) chatMessages.innerHTML = '';
@@ -1376,6 +1407,30 @@ function appendActivity(activity) {
     if (emptyEl) emptyEl.style.display = 'none';
     activityList.appendChild(item);
     activityList.scrollTop = activityList.scrollHeight;
+
+    if (activity.event === 'tasks_executing') {
+        if (activeTaskTimerHandle) {
+            clearInterval(activeTaskTimerHandle);
+            activeTaskTimerHandle = null;
+        }
+        const baseMessage = detail || 'Running tasks...';
+        const startedAt = Date.now();
+        const detailEl = item.querySelector('.activity-detail');
+        activeTaskTimerItem = item;
+        activeTaskTimerHandle = setInterval(() => {
+            if (!detailEl || activeTaskTimerItem !== item) {
+                if (activeTaskTimerHandle) clearInterval(activeTaskTimerHandle);
+                activeTaskTimerHandle = null;
+                return;
+            }
+            const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+            detailEl.textContent = `${baseMessage} (${elapsed}s)`;
+        }, 100);
+    } else if (activity.event === 'tasks_completed' && activeTaskTimerHandle) {
+        clearInterval(activeTaskTimerHandle);
+        activeTaskTimerHandle = null;
+        activeTaskTimerItem = null;
+    }
 }
 
 function escapeHtml(str) {
@@ -1405,7 +1460,12 @@ function renderMessageContent(el, text) {
     if (!el) return;
     const safeText = typeof text === 'string' ? text : String(text || '');
     if (typeof marked !== 'undefined') {
-        el.innerHTML = marked.parse(safeText, { breaks: true, gfm: true });
+        const dirty = marked.parse(safeText, { breaks: true, gfm: true });
+        if (typeof DOMPurify !== 'undefined') {
+            el.innerHTML = DOMPurify.sanitize(dirty);
+        } else {
+            el.textContent = safeText;
+        }
         enhanceRenderedMessage(el);
     } else {
         el.textContent = safeText;
@@ -1519,7 +1579,10 @@ async function sendMessage(textOverride) {
                 const t = setTimeout(() => { camVideo.removeEventListener('loadeddata', onReady); resolve(); }, 3000);
                 camVideo.addEventListener('loadeddata', onReady);
             });
-        } catch (_) {
+        } catch (err) {
+            if (wantsCamera) {
+                showToast('Camera access denied. Message sent as text only.');
+            }
         }
     }
     let imgBase64 = null;

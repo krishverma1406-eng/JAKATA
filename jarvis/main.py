@@ -23,6 +23,7 @@ from config.settings import SETTINGS
 from core.agent import Agent
 from services.github_auth import COPILOT_TOKEN_PATH, GITHUB_TOKEN_PATH, login_via_device_flow
 from services.reminders import get_reminder_service
+from utils.interrupts import register_keyboard_interrupt
 
 
 CONSOLE = Console(highlight=False, soft_wrap=True)
@@ -477,15 +478,23 @@ def _run_combined_mode(agent: Agent, renderer: CliRenderer) -> None:
         wake_thread = threading.Thread(target=_wake_loop, daemon=True)
         wake_thread.start()
 
+    interrupt_count = 0
     while not stop_event.is_set():
         try:
             user_input = renderer.input().strip()
-        except (EOFError, KeyboardInterrupt):
-            # Only exit if user actually pressed Ctrl+C, not from background thread noise
+            interrupt_count = 0
+        except EOFError:
             if stop_event.is_set():
                 renderer.info("\nJARVIS: Shutting down.")
                 break
-            # Spurious interrupt from background thread - ignore and continue
+            continue
+        except KeyboardInterrupt:
+            interrupt_count, should_exit = register_keyboard_interrupt(interrupt_count)
+            if should_exit:
+                renderer.info("\nJARVIS: Exiting on repeated interrupt.")
+                stop_event.set()
+                break
+            renderer.info("\nPress Ctrl+C again to exit, or continue typing.")
             continue
 
         if user_input.lower() in {"exit", "quit"}:

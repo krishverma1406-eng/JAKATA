@@ -99,6 +99,9 @@ class Planner:
     ) -> dict[str, Any]:
         if not self.should_plan(task, tool_definitions):
             return {"needs_planning": False, "steps": []}
+        likely = self._likely_tool_names(task, tool_definitions)
+        if len(likely) == 1:
+            return {"needs_planning": False, "steps": []}
 
         planner_prompt = (
             "You are the high-level planning layer for a tool-using assistant.\n"

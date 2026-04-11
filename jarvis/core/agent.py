@@ -6,6 +6,8 @@ import json
 import re
 import time
 import uuid
+import queue
+import threading
 from datetime import datetime
 from typing import Any, Callable
 
@@ -101,7 +103,10 @@ _FALLBACK_BLOCKING_SIGNALS = (
     "403",
     "unauthorized",
     "forbidden",
+    "timed out",
+    "timeout",
 )
+_TOOL_CALL_TIMEOUT_SECONDS = 30
 
 
 def _tool_failed(result: dict[str, Any]) -> bool:
@@ -252,6 +257,7 @@ class Agent:
 
         messages = self._build_messages(user_message, memory_context, plan, plan_note, mode_config)
         tool_trace: list[dict[str, Any]] = []
+        seen_calls_this_turn: set[tuple[str, str]] = set()
         task_kind = self._task_kind(user_message, plan)
         total_started_at = time.perf_counter()
         last_response_meta: dict[str, Any] = {}
@@ -320,6 +326,27 @@ class Agent:
             for tool_call in tool_calls:
                 tool_name = tool_call["name"]
                 tool_args = tool_call.get("arguments", {})
+                call_key = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
+                if call_key in seen_calls_this_turn:
+                    result = {"ok": False, "error": "Duplicate tool call skipped"}
+                    tool_trace.append(
+                        {
+                            "name": tool_name,
+                            "arguments": tool_args,
+                            "result": result,
+                            "fallback_used": False,
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "name": tool_name,
+                            "tool_call_id": tool_call.get("id"),
+                            "content": json.dumps(result, ensure_ascii=True, default=str),
+                        }
+                    )
+                    continue
+                seen_calls_this_turn.add(call_key)
                 plan_step_index = self.planner.next_matching_step_index(plan, tool_name)
                 if event_handler is not None:
                     event_handler(
@@ -938,6 +965,36 @@ class Agent:
         lowered = str(error or "").lower()
         return any(signal in lowered for signal in _FALLBACK_BLOCKING_SIGNALS)
 
+    def _run_tool_with_timeout(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        runtime_context: dict[str, Any],
+        timeout: int = _TOOL_CALL_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        result_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+
+        def _invoke_tool() -> None:
+            try:
+                payload = self.tools.run_tool(tool_name, arguments, runtime_context)
+            except Exception as exc:  # pragma: no cover - exercised via caller path
+                payload = {"ok": False, "error": str(exc)}
+            try:
+                result_queue.put_nowait(payload)
+            except queue.Full:
+                return
+
+        worker = threading.Thread(target=_invoke_tool, name=f"tool:{tool_name}", daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            return {"ok": False, "error": f"{tool_name} timed out after {timeout}s"}
+
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            return {"ok": False, "error": f"{tool_name} returned no result"}
+
     def _execute_with_chain(
         self,
         tool_name: str,
@@ -945,7 +1002,7 @@ class Agent:
         runtime_context: dict[str, Any],
     ) -> dict[str, Any]:
         """Run a tool, then automatically try fallbacks before returning to the model."""
-        result = self.tools.run_tool(tool_name, arguments, runtime_context)
+        result = self._run_tool_with_timeout(tool_name, arguments, runtime_context)
         if isinstance(result, dict) and result.get("ok") is True:
             return result
 
@@ -958,7 +1015,7 @@ class Agent:
             if not self.tools.has_tool(fallback_name):
                 continue
             fallback_args = self._adapt_args_for_fallback(tool_name, fallback_name, arguments)
-            fallback_result = self.tools.run_tool(fallback_name, fallback_args, runtime_context)
+            fallback_result = self._run_tool_with_timeout(fallback_name, fallback_args, runtime_context)
             if isinstance(fallback_result, dict) and fallback_result.get("ok") is True:
                 fallback_result["_fallback_used"] = True
                 fallback_result["_original_tool"] = tool_name

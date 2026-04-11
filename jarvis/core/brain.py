@@ -4,12 +4,34 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 from typing import Any, Callable
 
 import requests
 
 from config.settings import DATA_AI_DIR, SETTINGS, Settings
+
+
+class ProviderCircuitBreaker:
+    def __init__(self, failure_threshold: int = 3, cooldown_seconds: int = 60) -> None:
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self._failures: dict[str, int] = {}
+        self._open_until: dict[str, float] = {}
+
+    def is_open(self, provider: str) -> bool:
+        return time.time() < self._open_until.get(provider, 0.0)
+
+    def record_failure(self, provider: str) -> None:
+        failures = self._failures.get(provider, 0) + 1
+        self._failures[provider] = failures
+        if failures >= self.failure_threshold:
+            self._open_until[provider] = time.time() + float(self.cooldown_seconds)
+
+    def record_success(self, provider: str) -> None:
+        self._failures.pop(provider, None)
+        self._open_until.pop(provider, None)
 
 
 class Brain:
@@ -23,6 +45,8 @@ class Brain:
         )
         self._prompt_cache_value = ""
         self._prompt_cache_state: tuple[tuple[str, int], ...] = ()
+        self._circuit = ProviderCircuitBreaker()
+        self._max_input_tokens = 28000
 
     def chat(
         self,
@@ -42,20 +66,26 @@ class Brain:
         )
 
         provider_errors: list[str] = []
-        try:
-            response = self._call_nvidia(
-                system_messages,
-                compiled_messages,
-                tools or [],
-                task_kind,
-                response_format,
-                stream_handler,
-            )
-            if self._response_has_payload(response):
-                return response
-            provider_errors.append("nvidia: empty response")
-        except Exception as exc:  # pragma: no cover - depends on auth/network
-            provider_errors.append(f"nvidia: {exc}")
+        if not self._circuit.is_open("nvidia"):
+            try:
+                response = self._call_nvidia(
+                    system_messages,
+                    compiled_messages,
+                    tools or [],
+                    task_kind,
+                    response_format,
+                    stream_handler,
+                )
+                if self._response_has_payload(response):
+                    self._circuit.record_success("nvidia")
+                    return response
+                provider_errors.append("nvidia: empty response")
+                self._circuit.record_failure("nvidia")
+            except Exception as exc:  # pragma: no cover - depends on auth/network
+                provider_errors.append(f"nvidia: {exc}")
+                self._circuit.record_failure("nvidia")
+        else:
+            provider_errors.append("nvidia: skipped (circuit open)")
 
         try:
             response = self._call_groq(
@@ -67,10 +97,13 @@ class Brain:
                 stream_handler,
             )
             if self._response_has_payload(response):
+                self._circuit.record_success("groq")
                 return response
             provider_errors.append("groq: empty response")
+            self._circuit.record_failure("groq")
         except Exception as exc:  # pragma: no cover - depends on auth/network
             provider_errors.append(f"groq: {exc}")
+            self._circuit.record_failure("groq")
 
         try:
             response = self._call_openrouter(
@@ -82,10 +115,13 @@ class Brain:
                 stream_handler,
             )
             if self._response_has_payload(response):
+                self._circuit.record_success("openrouter")
                 return response
             provider_errors.append("openrouter: empty response")
+            self._circuit.record_failure("openrouter")
         except Exception as exc:  # pragma: no cover - depends on auth/network
             provider_errors.append(f"openrouter: {exc}")
+            self._circuit.record_failure("openrouter")
 
         return self._offline_response(compiled_messages, tools or [], provider_errors)
 
@@ -177,7 +213,36 @@ class Brain:
             compiled_messages.append(normalized)
 
         system_messages = [part.strip() for part in system_parts if part and part.strip()]
+        if self._estimate_tokens(compiled_messages) > self._max_input_tokens:
+            compiled_messages = self._trim_to_token_limit(compiled_messages, self._max_input_tokens)
         return system_messages, compiled_messages
+
+    def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
+        total_chars = sum(len(str(message.get("content", ""))) for message in messages)
+        return max(1, total_chars // 4)
+
+    def _trim_to_token_limit(
+        self,
+        messages: list[dict[str, Any]],
+        token_limit: int,
+    ) -> list[dict[str, Any]]:
+        trimmed = list(messages)
+        while len(trimmed) > 1 and self._estimate_tokens(trimmed) > token_limit:
+            oldest = trimmed.pop(0)
+            if oldest.get("role") == "assistant" and oldest.get("tool_calls"):
+                tool_call_ids = {
+                    str(call.get("id", "")).strip()
+                    for call in oldest.get("tool_calls", [])
+                    if str(call.get("id", "")).strip()
+                }
+                while trimmed and trimmed[0].get("role") == "tool":
+                    tool_call_id = str(trimmed[0].get("tool_call_id", "")).strip()
+                    if tool_call_ids and tool_call_id and tool_call_id not in tool_call_ids:
+                        break
+                    trimmed.pop(0)
+            while trimmed and trimmed[0].get("role") == "tool":
+                trimmed.pop(0)
+        return trimmed
 
     def build_system_prompt_for_context(self, tool_definitions: list[dict[str, Any]]) -> str:
         base_prompt = self.build_system_prompt()

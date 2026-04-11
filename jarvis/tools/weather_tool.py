@@ -12,6 +12,8 @@ from urllib.request import Request, urlopen
 from config.settings import SETTINGS
 from core.memory import Memory
 
+_MEMORY: Memory | None = None
+
 
 TOOL_DEFINITION = {
     "name": "weather_tool",
@@ -59,13 +61,20 @@ def execute(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _infer_location() -> str:
-    memory = Memory()
+    memory = _get_memory()
     hits = memory.recall("current city location where do i live currently", 8)
     for hit in hits:
         candidate = _extract_location_candidate(hit)
         if candidate:
             return candidate
     return ""
+
+
+def _get_memory() -> Memory:
+    global _MEMORY
+    if _MEMORY is None:
+        _MEMORY = Memory()
+    return _MEMORY
 
 
 def _extract_location_candidate(text: str) -> str:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
@@ -168,5 +170,10 @@ def _direct_fetch(url: str) -> str:
             body = response.read().decode("utf-8", errors="ignore")
     except Exception:
         return ""
-    text = " ".join(body.replace("\r", " ").replace("\n", " ").split())
+
+    body = re.sub(r"<script[^>]*>.*?</script>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+    body = re.sub(r"<style[^>]*>.*?</style>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = html.unescape(body)
+    text = " ".join(body.split())
     return text[:12000]

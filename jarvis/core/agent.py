@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import re
 import time
 import uuid
@@ -124,6 +125,21 @@ def _get_fallback_hint(tool_name: str, error: str) -> str:
             "Tell the user exactly what's missing. Do not attempt any fallback."
         )
     return _FALLBACK_HINTS.get(tool_name, "")
+
+
+def _run_tool_in_subprocess(
+    tool_name: str,
+    arguments: dict[str, Any],
+    runtime_context: dict[str, Any],
+    result_queue: Any,
+) -> None:
+    """Execute a tool in a child process so timeouts can terminate execution safely."""
+    try:
+        tools = ToolRegistry()
+        payload = tools.run_tool(tool_name, arguments, runtime_context)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        payload = {"ok": False, "error": str(exc)}
+    result_queue.put(payload)
 
 
 class Agent:
@@ -972,6 +988,31 @@ class Agent:
         runtime_context: dict[str, Any],
         timeout: int = _TOOL_CALL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
+        if timeout > 0 and isinstance(getattr(self, "tools", None), ToolRegistry):
+            try:
+                context = mp.get_context("spawn")
+                process_queue = context.Queue(maxsize=1)
+                process = context.Process(
+                    target=_run_tool_in_subprocess,
+                    args=(tool_name, arguments, runtime_context, process_queue),
+                    daemon=True,
+                )
+                process.start()
+                process.join(timeout)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(1)
+                    return {"ok": False, "error": f"{tool_name} timed out after {timeout}s"}
+                if process.exitcode not in (0, None):
+                    return {"ok": False, "error": f"{tool_name} failed with exit code {process.exitcode}"}
+                if process_queue.empty():
+                    return {"ok": False, "error": f"{tool_name} returned no result"}
+                return dict(process_queue.get_nowait())
+            except Exception:
+                # If process startup fails, fall back to thread-based timeout handling.
+                pass
+
+        result_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         result_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
 
         def _invoke_tool() -> None:

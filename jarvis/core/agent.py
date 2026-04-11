@@ -1013,6 +1013,8 @@ class Agent:
                 pass
 
         result_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        result_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+
         def _invoke_tool() -> None:
             try:
                 payload = self.tools.run_tool(tool_name, arguments, runtime_context)

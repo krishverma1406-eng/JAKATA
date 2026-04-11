@@ -228,7 +228,20 @@ class Brain:
     ) -> list[dict[str, Any]]:
         trimmed = list(messages)
         while len(trimmed) > 1 and self._estimate_tokens(trimmed) > token_limit:
-            trimmed.pop(0)
+            oldest = trimmed.pop(0)
+            if oldest.get("role") == "assistant" and oldest.get("tool_calls"):
+                tool_call_ids = {
+                    str(call.get("id", "")).strip()
+                    for call in oldest.get("tool_calls", [])
+                    if str(call.get("id", "")).strip()
+                }
+                while trimmed and trimmed[0].get("role") == "tool":
+                    tool_call_id = str(trimmed[0].get("tool_call_id", "")).strip()
+                    if tool_call_ids and tool_call_id and tool_call_id not in tool_call_ids:
+                        break
+                    trimmed.pop(0)
+            while trimmed and trimmed[0].get("role") == "tool":
+                trimmed.pop(0)
         return trimmed
 
     def build_system_prompt_for_context(self, tool_definitions: list[dict[str, Any]]) -> str:

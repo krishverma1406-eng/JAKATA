@@ -6,7 +6,8 @@ import json
 import re
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import queue
+import threading
 from datetime import datetime
 from typing import Any, Callable
 
@@ -102,6 +103,8 @@ _FALLBACK_BLOCKING_SIGNALS = (
     "403",
     "unauthorized",
     "forbidden",
+    "timed out",
+    "timeout",
 )
 _TOOL_CALL_TIMEOUT_SECONDS = 30
 
@@ -969,16 +972,28 @@ class Agent:
         runtime_context: dict[str, Any],
         timeout: int = _TOOL_CALL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(self.tools.run_tool, tool_name, arguments, runtime_context)
-        try:
-            return future.result(timeout=timeout)
-        except TimeoutError:
+        result_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+
+        def _invoke_tool() -> None:
+            try:
+                payload = self.tools.run_tool(tool_name, arguments, runtime_context)
+            except Exception as exc:  # pragma: no cover - exercised via caller path
+                payload = {"ok": False, "error": str(exc)}
+            try:
+                result_queue.put_nowait(payload)
+            except queue.Full:
+                return
+
+        worker = threading.Thread(target=_invoke_tool, name=f"tool:{tool_name}", daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
             return {"ok": False, "error": f"{tool_name} timed out after {timeout}s"}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            return {"ok": False, "error": f"{tool_name} returned no result"}
 
     def _execute_with_chain(
         self,

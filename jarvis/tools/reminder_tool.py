@@ -35,6 +35,12 @@ TOOL_DEFINITION = {
                 "type": "integer",
                 "description": "Optional relative delay in seconds for create.",
             },
+            "recur": {
+                "type": "string",
+                "enum": ["none", "daily", "weekly", "weekdays"],
+                "description": "Recurrence pattern.",
+                "default": "none",
+            },
             "reminder_id": {
                 "type": "string",
                 "description": "Reminder id for delete.",
@@ -60,6 +66,7 @@ def execute(params: dict[str, Any]) -> dict[str, Any]:
         reminder = service.add_reminder(
             text=str(params.get("text", "")).strip(),
             due_at=due_at,
+            recur=str(params.get("recur", "none")).strip(),
         )
         return {"ok": True, "reminder": reminder}
 

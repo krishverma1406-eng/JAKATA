@@ -365,6 +365,7 @@ class Agent:
                         "session_name": str(self.session_meta.get("display_name", "")).strip(),
                         **(runtime_context or {}),
                     },
+                    event_handler=event_handler,
                 )
                 tool_trace.append(
                     {
@@ -608,7 +609,7 @@ class Agent:
             "unit test",
             "test case",
         )
-        code_terms = (
+        code_nouns = {
             "script",
             "code",
             "coding",
@@ -617,8 +618,8 @@ class Agent:
             "class",
             "module",
             "api",
-        )
-        code_adjacent = {
+        }
+        code_intent_verbs = {
             "write",
             "create",
             "build",
@@ -630,13 +631,33 @@ class Agent:
             "test",
             "compile",
             "run",
+            "edit",
+            "update",
+            "add",
+            "remove",
+            "change",
+        }
+        execution_markers = {
+            "traceback",
+            "exception",
+            "error",
+            "failing",
+            "failure",
+            "bug",
+            "test",
+            "tests",
+            "unit",
+            "stack",
         }
         lowered_tokens = set(re.findall(r"[a-z0-9_+.:-]+", lowered))
         if any(step.get("tool_name") == "code_writer" for step in plan.get("steps", [])):
             return "code"
         if any(marker in lowered for marker in code_phrases):
             return "code"
-        if any(marker in lowered_tokens for marker in code_terms) and bool(lowered_tokens & code_adjacent):
+        has_code_noun = bool(lowered_tokens & code_nouns)
+        has_code_intent = bool(lowered_tokens & code_intent_verbs)
+        has_execution_marker = bool(lowered_tokens & execution_markers)
+        if has_code_noun and (has_code_intent or has_execution_marker):
             return "code"
         if any(extension in lowered for extension in (".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".html", ".css", ".sql", ".sh", ".ps1")):
             return "code"
@@ -696,6 +717,30 @@ class Agent:
             "yesterday",
         )
         return any(marker in lowered for marker in memory_markers)
+
+    def _is_session_summary_request(self, user_message: str) -> bool:
+        lowered = user_message.lower()
+        markers = (
+            "what did we talk",
+            "what we talked",
+            "what have we discussed",
+            "what did we discuss",
+            "summarize our",
+            "our chat",
+            "chat so far",
+            "conversation so far",
+            "recent chat",
+            "recent conversation",
+            "previous session",
+            "previous sessions",
+            "last session",
+            "what were we",
+            "what did we build",
+            "what was i doing",
+            "yesterday",
+            "earlier today",
+        )
+        return any(marker in lowered for marker in markers)
 
     def _should_extract_memory(
         self,
@@ -894,8 +939,16 @@ class Agent:
             "notes_tool": (
                 "save a note", "write a note", "briefing note", "draft a note", "save note", "take a note",
             ),
+            "task_manager": (
+                "task", "todo", "to-do", "backlog", "mark done", "complete task",
+                "blocked", "in progress", "task list", "create task", "new task",
+            ),
             "reminder_tool": (
                 "remind me", "reminder", "remind", "at 6", "at 7", "tomorrow at", "today at",
+            ),
+            "system_info_tool": (
+                "system info", "cpu", "ram", "battery", "disk", "storage", "processes",
+                "system alert", "system alerts", "low battery", "all clear",
             ),
             "calendar_tool": (
                 "calendar", "event", "events", "schedule", "meeting", "upcoming",
@@ -905,6 +958,10 @@ class Agent:
             ),
             "weather_tool": (
                 "weather", "forecast", "temperature", "rain", "umbrella",
+            ),
+            "image_gen_tool": (
+                "draw", "image", "picture", "visualize", "illustration", "concept art",
+                "mockup", "poster", "cover art", "generate image", "create image",
             ),
             "browser_control": (
                 "browser", "website", "web page", "youtube", "spotify web", "soundcloud", "open ", "search ",
@@ -931,6 +988,10 @@ class Agent:
             ),
             "session_tool": (
                 "session", "rename this session", "recent sessions", "past session", "current session",
+            ),
+            "code_runner": (
+                "run python", "execute code", "test snippet", "verify output", "run this code",
+                "execute this code", "stdin", "python snippet",
             ),
             "music_player": (
                 "local music", "play local", "mp3", "song file",
@@ -964,6 +1025,27 @@ class Agent:
     def _tool_error_blocks_fallback(self, error: str) -> bool:
         lowered = str(error or "").lower()
         return any(signal in lowered for signal in _FALLBACK_BLOCKING_SIGNALS)
+
+    def _tool_is_registered(self, tool_name: str) -> bool:
+        has_tool = getattr(self.tools, "has_tool", None)
+        if callable(has_tool):
+            try:
+                return bool(has_tool(tool_name))
+            except Exception:
+                return False
+
+        get_tool_definitions = getattr(self.tools, "get_tool_definitions", None)
+        if callable(get_tool_definitions):
+            try:
+                return any(
+                    str(tool_definition.get("name", "")).strip() == tool_name
+                    for tool_definition in get_tool_definitions()
+                    if isinstance(tool_definition, dict)
+                )
+            except Exception:
+                return False
+
+        return False
 
     def _run_tool_with_timeout(
         self,
@@ -1000,9 +1082,15 @@ class Agent:
         tool_name: str,
         arguments: dict[str, Any],
         runtime_context: dict[str, Any],
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Run a tool, then automatically try fallbacks before returning to the model."""
-        result = self._run_tool_with_timeout(tool_name, arguments, runtime_context)
+        result = self._run_tool_with_timeout(
+            tool_name,
+            arguments,
+            runtime_context,
+            timeout=_TOOL_CALL_TIMEOUT_SECONDS,
+        )
         if isinstance(result, dict) and result.get("ok") is True:
             return result
 
@@ -1010,12 +1098,28 @@ class Agent:
         if self._tool_error_blocks_fallback(error_msg):
             return result
 
-        fallbacks = TOOL_FALLBACK_CHAINS.get(tool_name, [])
+        fallbacks = [
+            fallback_name
+            for fallback_name in TOOL_FALLBACK_CHAINS.get(tool_name, [])
+            if self._tool_is_registered(fallback_name)
+        ]
+        if fallbacks and event_handler is not None:
+            event_handler(
+                {
+                    "type": "tool_fallback_suggested",
+                    "failed_tool": tool_name,
+                    "fallback_tools": list(fallbacks),
+                    "error": str(result.get("error", "")) if isinstance(result, dict) else "",
+                }
+            )
         for fallback_name in fallbacks:
-            if not self.tools.has_tool(fallback_name):
-                continue
             fallback_args = self._adapt_args_for_fallback(tool_name, fallback_name, arguments)
-            fallback_result = self._run_tool_with_timeout(fallback_name, fallback_args, runtime_context)
+            fallback_result = self._run_tool_with_timeout(
+                fallback_name,
+                fallback_args,
+                runtime_context,
+                timeout=_TOOL_CALL_TIMEOUT_SECONDS,
+            )
             if isinstance(fallback_result, dict) and fallback_result.get("ok") is True:
                 fallback_result["_fallback_used"] = True
                 fallback_result["_original_tool"] = tool_name
@@ -1102,8 +1206,9 @@ class Agent:
         available = {str(tool_definition["name"]) for tool_definition in all_tool_definitions}
         forced: set[str] = set()
         has_live_image = bool(isinstance(runtime_context, dict) and str(runtime_context.get("imgbase64", "")).strip())
+        session_summary_request = self._is_session_summary_request(user_message)
 
-        if any(
+        if session_summary_request or any(
             marker in lowered
             for marker in (
                 "session",
@@ -1143,12 +1248,66 @@ class Agent:
                 "storage",
                 "running processes",
                 "process list",
+                "system alert",
+                "system alerts",
+                "low battery",
+                "all clear",
+                "anything wrong with system",
             )
         ):
             forced.add("system_info_tool")
 
         if any(marker in lowered for marker in ("weather", "forecast", "temperature")):
             forced.add("weather_tool")
+
+        if any(
+            marker in lowered
+            for marker in (
+                "generate image",
+                "create image",
+                "make an image",
+                "make a picture",
+                "draw ",
+                "draw me",
+                "visualize",
+                "illustration",
+                "concept art",
+                "mockup",
+            )
+        ):
+            forced.add("image_gen_tool")
+
+        if any(
+            marker in lowered
+            for marker in (
+                "run python",
+                "execute python",
+                "run this code",
+                "execute this code",
+                "test this snippet",
+                "verify code output",
+                "run this script",
+            )
+        ):
+            forced.add("code_runner")
+
+        if any(
+            marker in lowered
+            for marker in (
+                "add task",
+                "create task",
+                "new task",
+                "todo",
+                "to-do",
+                "task list",
+                "mark task",
+                "complete task",
+                "blocked task",
+                "in progress task",
+                "backlog",
+            )
+        ):
+            forced.add("task_manager")
 
         if any(
             marker in lowered
@@ -1274,7 +1433,9 @@ class Agent:
                 forced.discard("music_player")
         if "datetime_tool" in forced:
             forced.discard("system_info_tool")
-        if "memory_query" in forced:
+        if session_summary_request:
+            forced.discard("memory_query")
+        elif "memory_query" in forced:
             forced.discard("session_tool")
 
         return forced & available
@@ -1381,12 +1542,43 @@ class Agent:
                     f"CPU {result.get('cpu_percent')}%, RAM {result.get('ram_percent')}%, "
                     f"disk {result.get('disk_percent')}%."
                 )
+            if tool_name == "system_info_tool" and isinstance(result.get("alerts"), list):
+                alerts = [str(item.get("message", "")).strip() for item in result.get("alerts", []) if isinstance(item, dict)]
+                if alerts:
+                    return " ".join(alerts[:3])
+                if result.get("all_clear"):
+                    return "No active system alerts."
             if tool_name == "file_manager":
                 items = result.get("items")
                 if isinstance(items, list):
                     return f"I found {len(items)} items in {result.get('path', 'that folder')}."
+            if tool_name == "task_manager":
+                task = result.get("task")
+                if isinstance(task, dict):
+                    title = str(task.get("title", "Untitled")).strip() or "Untitled"
+                    status = str(task.get("status", "updated")).strip() or "updated"
+                    return f"Task '{title}' is now {status}."
+                tasks = result.get("tasks")
+                if isinstance(tasks, list):
+                    count = len(tasks)
+                    suffix = "s" if count != 1 else ""
+                    return f"I found {count} active task{suffix}."
+                deleted = str(result.get("deleted", "")).strip()
+                if deleted:
+                    return f"Deleted task {deleted}."
+            if tool_name == "code_runner":
+                stdout = str(result.get("stdout", "")).strip()
+                stderr = str(result.get("stderr", "")).strip()
+                if stdout:
+                    return stdout
+                if stderr:
+                    return stderr
+                if result.get("exit_code") == 0:
+                    return "The code ran successfully with no output."
             if tool_name == "browser_control":
                 return "The browser action ran, but I couldn't produce a clean final summary."
+            if tool_name == "image_gen_tool" and (result.get("url") or result.get("path")):
+                return "The image is ready. It will open in the viewer."
             if tool_name == "vision_tool" and result.get("analysis"):
                 return str(result.get("analysis")).strip()
 

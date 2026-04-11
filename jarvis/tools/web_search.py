@@ -8,7 +8,7 @@ import os
 import re
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -42,24 +42,27 @@ TOOL_DEFINITION = {
 def execute(params: dict[str, Any]) -> dict[str, Any]:
     query = str(params.get("query", "")).strip()
     max_results = max(1, min(int(params.get("max_results", 5) or 5), 10))
+    candidate_limit = max_results if max_results >= 10 else min(max_results * 2, 10)
     fetch_full_page = bool(params.get("fetch_full_page", False))
     if not query:
         return {"ok": False, "error": "Missing query.", "results": []}
 
     provider_errors: list[str] = []
-    tavily_payload = _search_tavily(query, max_results)
+    tavily_payload = _search_tavily(query, candidate_limit)
     if tavily_payload["ok"]:
         results = tavily_payload["results"]
         provider = "tavily"
     else:
         provider_errors.append(f"tavily: {tavily_payload['error']}")
-        brave_payload = _search_brave(query, max_results)
+        brave_payload = _search_brave(query, candidate_limit)
         if brave_payload["ok"]:
             results = brave_payload["results"]
             provider = "brave"
         else:
             provider_errors.append(f"brave: {brave_payload['error']}")
             return {"ok": False, "error": " | ".join(provider_errors), "results": []}
+
+    results = _post_process_results(results, query)[:max_results]
 
     if fetch_full_page:
         for item in results:
@@ -75,6 +78,59 @@ def execute(params: dict[str, Any]) -> dict[str, Any]:
         "query": query,
         "results": results,
     }
+
+
+def _post_process_results(results: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Score, deduplicate, and flag likely-answering search results."""
+    query_tokens = _query_tokens(query)
+    query_lower = query.strip().lower()
+    seen_domains: set[str] = set()
+    processed: list[dict[str, Any]] = []
+
+    for result in results:
+        item = dict(result)
+        url = str(item.get("url", "")).strip()
+        try:
+            domain = urlparse(url).netloc.lower()
+        except Exception:
+            domain = url[:50].lower()
+        domain = domain[4:] if domain.startswith("www.") else domain
+        dedupe_key = domain or url[:50].lower()
+        if dedupe_key and dedupe_key in seen_domains:
+            continue
+        if dedupe_key:
+            seen_domains.add(dedupe_key)
+
+        title = str(item.get("title", "")).strip().lower()
+        snippet = str(item.get("snippet", "") or item.get("content", "")).strip().lower()
+        haystack = f"{title} {snippet}".strip()
+        hit_count = sum(1 for token in query_tokens if token in haystack)
+        relevance = hit_count / max(len(query_tokens), 1)
+        if query_lower and query_lower in haystack:
+            relevance = max(relevance, 0.95)
+
+        item["relevance_score"] = round(min(relevance, 1.0), 2)
+        item["answers_query"] = bool(
+            (query_lower and query_lower in haystack)
+            or (query_tokens and hit_count >= max(1, len(query_tokens) // 2))
+        )
+        processed.append(item)
+
+    processed.sort(
+        key=lambda item: (
+            int(bool(item.get("answers_query"))),
+            float(item.get("relevance_score", 0.0)),
+            len(str(item.get("title", ""))),
+        ),
+        reverse=True,
+    )
+    return processed
+
+
+def _query_tokens(query: str) -> list[str]:
+    tokens = [token for token in re.findall(r"[a-z0-9]+", query.lower()) if len(token) > 1]
+    meaningful = [token for token in tokens if token not in {"the", "and", "for", "with", "from", "what", "when"}]
+    return meaningful or tokens
 
 
 def _search_tavily(query: str, max_results: int) -> dict[str, Any]:

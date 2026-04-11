@@ -14,8 +14,9 @@ from core.memory import Memory
 
 CHECK_INTERVALS = {
     "reminders": 30,
-    "briefing": 300,
-    "stale_task": 3600,
+    "briefing": 1800,
+    "stale_task": 7200,
+    "system_alerts": 120,
 }
 
 
@@ -48,6 +49,15 @@ class ProactiveEngine:
     def stop(self) -> None:
         self._stop.set()
 
+    def on_session_start(self, session_id: str) -> None:
+        """Fire proactive checks when a brand-new session starts."""
+        self.session_id = str(session_id or "").strip()
+        threading.Thread(
+            target=self._fire_session_start_briefing,
+            daemon=True,
+            name=f"jarvis-session-start-{self.session_id or 'default'}",
+        ).start()
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             now = time.time()
@@ -70,6 +80,9 @@ class ProactiveEngine:
             return
         if check_name == "stale_task":
             self._check_stale_tasks()
+            return
+        if check_name == "system_alerts":
+            self._check_system_alerts()
 
     def _check_reminders(self) -> None:
         from services.reminders import get_reminder_service
@@ -89,56 +102,49 @@ class ProactiveEngine:
 
     def _check_briefing(self) -> None:
         projects = self.memory.active_project_items(limit=5)
-        calendar_lines: list[str] = []
-        try:
-            from services.calendar_service import get_calendar_service
-
-            events = get_calendar_service().today_events(max_results=5)
-            for event in events[:5]:
-                if not isinstance(event, dict):
-                    continue
-                summary = str(event.get("summary", "")).strip() or "(untitled event)"
-                start = str(event.get("start", "")).strip()
-                line = summary if not start else f"{summary} | {start}"
-                calendar_lines.append(line)
-        except Exception:
-            calendar_lines = []
+        calendar_lines = self._get_today_calendar()
         if not projects and not calendar_lines:
             return
 
-        prompt = (
-            "You are JARVIS, a proactive personal AI. "
-            "The user (Krish) is NOT present right now — you're doing a background check.\n\n"
-            "Active projects in memory:\n"
-            + "\n".join(f"- {project}" for project in projects)
-            + "\n\nToday's calendar:\n"
-            + ("\n".join(f"- {line}" for line in calendar_lines) if calendar_lines else "- No scheduled calendar events found.")
-            + "\n\n"
-            "Current time: "
-            + datetime.now().strftime("%A %I:%M %p")
-            + "\n\n"
-            "Decide: Is there ONE specific, useful thing to tell Krish proactively right now?\n"
-            "Examples of good proactive messages:\n"
-            "- 'One project hasn't been touched in a while — want to pick it back up?'\n"
-            "- 'You have an event later today that may affect your schedule.'\n"
-            "- 'One reminder is due soon and should probably be handled first.'\n\n"
-            "If there's nothing genuinely useful to say, respond with exactly: SKIP\n"
-            "If there IS something useful, write ONE short proactive JARVIS message (max 2 sentences). "
-            "Sound like JARVIS, not a notification. Be specific about the real item that needs attention. "
-            "Do not invent project names, deadlines, or events."
-        )
+        now = datetime.now()
+        hour = now.hour
+        if 8 <= hour <= 10:
+            briefing_type = "morning"
+        elif 13 <= hour <= 15:
+            briefing_type = "afternoon"
+        elif 18 <= hour <= 20:
+            briefing_type = "evening"
+        else:
+            return
 
-        response = self.brain.chat(
-            messages=[{"role": "user", "content": prompt}],
-            task_kind="simple",
-            system_override="You are JARVIS. Be brief, direct, and genuinely useful.",
+        cache_key = f"briefing_{briefing_type}_{now.strftime('%Y-%m-%d')}"
+        if cache_key in self._delivered_ids:
+            return
+
+        prompt = (
+            f"You are JARVIS giving Krish a {briefing_type} briefing. "
+            "Synthesize this into 1-2 short punchy sentences. "
+            "Lead with what's most important. Sound like Iron Man's JARVIS.\n\n"
+            f"Projects: {', '.join(projects[:3])}\n"
+            f"Calendar: {', '.join(calendar_lines[:2]) if calendar_lines else 'nothing scheduled'}\n"
+            f"Time: {now.strftime('%I:%M %p')}\n\n"
+            "Morning = what to focus on today. "
+            "Afternoon = progress check. "
+            "Evening = wrap-up plus tomorrow prep. "
+            "Be specific. No filler."
         )
+        try:
+            response = self.brain.chat(
+                messages=[{"role": "user", "content": prompt}],
+                task_kind="simple",
+                system_override="You are JARVIS. One briefing. No padding.",
+            )
+        except Exception:
+            return
         content = str(response.get("content", "")).strip()
-        if content and content.upper() != "SKIP" and len(content) > 10:
-            cache_key = f"briefing:{content.lower()}"
-            if cache_key not in self._delivered_ids:
-                self._delivered_ids.add(cache_key)
-                self._push(content, kind="briefing")
+        if content and len(content) > 10:
+            self._delivered_ids.add(cache_key)
+            self._push(content, kind="briefing")
 
     def _check_stale_tasks(self) -> None:
         records = self.memory._load_records_payload().get("records", [])
@@ -178,6 +184,110 @@ class ProactiveEngine:
         if cache_key not in self._delivered_ids:
             self._delivered_ids.add(cache_key)
             self._push(message, kind="stale_task")
+
+    def _check_system_alerts(self) -> None:
+        try:
+            import psutil
+        except ImportError:
+            return
+
+        battery = psutil.sensors_battery()
+        if battery and not battery.power_plugged and battery.percent < 15:
+            bucket = int(battery.percent // 5) * 5
+            cache_key = f"battery_low_{bucket}"
+            if cache_key in self._delivered_ids:
+                return
+            self._delivered_ids.add(cache_key)
+            self._push(
+                (
+                    f"Sir, battery is at {battery.percent:.0f}% and not charging. "
+                    "Might want to plug in before it cuts out."
+                ),
+                kind="alert",
+            )
+
+    def _get_today_calendar(self) -> list[str]:
+        try:
+            from services.calendar_service import get_calendar_service
+
+            events = get_calendar_service().today_events(max_results=3)
+        except Exception:
+            return []
+
+        lines: list[str] = []
+        for event in events[:3]:
+            if not isinstance(event, dict):
+                continue
+            summary = str(event.get("summary", "")).strip()
+            if not summary:
+                continue
+            start = str(event.get("start", "")).strip()
+            lines.append(f"{summary} at {start}" if start else summary)
+        return lines
+
+    def _fire_session_start_briefing(self) -> None:
+        projects = self.memory.active_project_items(limit=3)
+        try:
+            from services.reminders import get_reminder_service
+
+            service = get_reminder_service(self.settings)
+            due_reminders = service.pop_due_reminders()
+        except Exception:
+            due_reminders = []
+
+        for reminder in due_reminders:
+            reminder_id = str(reminder.get("id", "")).strip()
+            if reminder_id and reminder_id in self._delivered_ids:
+                continue
+            if reminder_id:
+                self._delivered_ids.add(reminder_id)
+            text = str(reminder.get("text", "")).strip()
+            if text:
+                self._push(
+                    f"Welcome back, sir. You have a pending reminder: {text}",
+                    kind="reminder",
+                    data=reminder,
+                )
+
+        if not projects:
+            return
+
+        payload = self.memory._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            return
+
+        stale_projects: list[str] = []
+        now = datetime.now(UTC)
+        for record in records:
+            if not record.get("active") or record.get("demoted") or record.get("tag") != "PROJECT":
+                continue
+            last_seen = record.get("last_retrieved_at") or record.get("updated_at", "")
+            if not last_seen:
+                continue
+            try:
+                last_dt = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=UTC)
+            if (now - last_dt).total_seconds() > 86400:
+                text = str(record.get("text", "")).strip()
+                if text:
+                    stale_projects.append(text[:80])
+
+        if not stale_projects:
+            return
+
+        stale_text = stale_projects[0][:60].rstrip()
+        cache_key = f"session_start_stale:{stale_text.lower()}:{now.strftime('%Y-%m-%d')}"
+        if cache_key in self._delivered_ids:
+            return
+        self._delivered_ids.add(cache_key)
+        self._push(
+            f"Welcome back. Your {stale_text} hasn't come up since yesterday - want to pick it up?",
+            kind="stale_task",
+        )
 
     def _generate_reminder_message(self, text: str, due_at: str) -> str:
         if due_at:

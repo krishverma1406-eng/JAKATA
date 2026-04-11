@@ -124,6 +124,62 @@ class UpgradeRegressionTests(unittest.TestCase):
         self.assertFalse(result.get("ok", True))
         self.assertEqual(dummy.tools.calls, [])
 
+    def test_nvidia_thinking_flag_only_added_for_supported_models(self) -> None:
+        brain = Brain()
+        brain.settings = types.SimpleNamespace(
+            nvidia_api_key="test-key",
+            nvidia_base_url="https://example.com/v1",
+            nvidia_timeout_seconds=30,
+        )
+        captured: dict[str, object] = {}
+
+        def fake_call_openai_compatible(**kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            return {"ok": True}
+
+        brain._call_openai_compatible = fake_call_openai_compatible  # type: ignore[method-assign]
+
+        with patch.object(brain, "_nvidia_model_for", return_value="meta/llama-3.3-70b-instruct"):
+            brain._call_nvidia(["system"], [{"role": "user", "content": "hello"}], [], "simple", None)
+        self.assertNotIn("chat_template_kwargs", captured["payload"])
+
+        with patch.object(brain, "_nvidia_model_for", return_value="deepseek-r1"):
+            brain._call_nvidia(["system"], [{"role": "user", "content": "hello"}], [], "simple", None)
+        self.assertEqual(captured["payload"]["chat_template_kwargs"], {"thinking": False})
+
+    def test_task_kind_does_not_false_trigger_on_plain_api_or_class_language(self) -> None:
+        agent = Agent.__new__(Agent)
+        simple_plan = {"steps": [], "needs_planning": False}
+
+        self.assertEqual(
+            Agent._task_kind(agent, "what api key do i need for the weather tool", simple_plan),
+            "simple",
+        )
+        self.assertEqual(
+            Agent._task_kind(agent, "what is my class schedule today", simple_plan),
+            "simple",
+        )
+
+    def test_task_kind_still_flags_real_code_requests(self) -> None:
+        agent = Agent.__new__(Agent)
+        simple_plan = {"steps": [], "needs_planning": False}
+
+        self.assertEqual(
+            Agent._task_kind(agent, "fix the api error in app.py", simple_plan),
+            "code",
+        )
+
+    def test_frontend_handles_stream_cancelled_events(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "frontend" / "script.js").read_text(encoding="utf-8")
+        self.assertIn("if (data.stream_cancelled)", script)
+        self.assertIn("stream-placeholder", script)
+
+    def test_memory_fix_script_uses_include_facts_parameter(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "scripts" / "test_memory_fixes.py").read_text(encoding="utf-8")
+        self.assertIn("_candidate_pool(include_facts=False)", source)
+        self.assertNotIn("include_chunks", source)
+
 
 if __name__ == "__main__":
     unittest.main()

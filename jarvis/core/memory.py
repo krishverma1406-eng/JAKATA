@@ -233,6 +233,11 @@ class Memory:
     def recall(self, query: str, limit: int | None = None) -> list[str]:
         limit = limit or self.settings.memory_top_k
         lowered = query.lower()
+        recent_query = self._is_recent_conversation_query(lowered)
+        if recent_query:
+            session_results = self._recall_from_sessions(query, limit)
+            if session_results:
+                return session_results[:limit]
         semantic_ready = self._semantic_retrieval_ready()
         record_payload = self._load_records_payload()
         records = record_payload.get("records", [])
@@ -251,7 +256,6 @@ class Memory:
             self._recent_session_candidates(),
             self._recent_log_candidates(),
         )
-        recent_query = self._is_recent_conversation_query(lowered)
         if recent_query and recent_candidates:
             recent_ranked, recent_best = self._rank_candidates(
                 query_variants,
@@ -1688,6 +1692,81 @@ class Memory:
     def _recent_session_candidates(self, max_turns: int = 24) -> list[str]:
         return self.session_store.recent_session_candidates(limit_files=4, max_turns=max_turns)
 
+    def _recall_from_sessions(self, query: str, limit: int) -> list[str]:
+        sessions = self.session_store.list_sessions(limit=10)
+        if not sessions:
+            return []
+
+        candidates: list[tuple[float, int, str]] = []
+        for session_index, session in enumerate(sessions[:5]):
+            session_id = str(session.get("session_id", "")).strip()
+            if not session_id:
+                continue
+            display_name = str(session.get("display_name", "Untitled session")).strip() or "Untitled session"
+            updated_at = str(session.get("updated_at", "")).strip()
+            messages = self.session_store.load_messages(session_id, limit_messages=20)
+            turn_summaries = self._session_turn_summaries(display_name, updated_at, messages)
+            for turn_offset, candidate in enumerate(turn_summaries):
+                score = self._token_overlap_score(query, candidate)
+                score += self._query_focus_bonus(query, candidate)
+                score += max(0, 5 - session_index) * 0.0001
+                score += max(0, 3 - turn_offset) * 0.00001
+                candidates.append((score, session_index, candidate))
+
+        if not candidates:
+            return []
+
+        any_overlap = any(score > 0 for score, _, _ in candidates)
+        if any_overlap:
+            ordered = sorted(candidates, key=lambda item: (-item[0], item[1], item[2]))
+        else:
+            ordered = list(candidates)
+
+        results: list[str] = []
+        seen: set[str] = set()
+        for _, _, candidate in ordered:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            results.append(candidate)
+            if len(results) >= max(1, limit):
+                break
+        return results
+
+    def _session_turn_summaries(
+        self,
+        display_name: str,
+        updated_at: str,
+        messages: list[dict[str, Any]],
+    ) -> list[str]:
+        turn_pairs: list[str] = []
+        pending_user = ""
+        session_date = updated_at[:10] if updated_at else "unknown date"
+        for message in messages:
+            role = str(message.get("role", "")).strip().lower()
+            content = self._session_excerpt(message.get("content", ""), limit=120)
+            if not content:
+                continue
+            if role == "user":
+                pending_user = content
+                continue
+            if role == "assistant" and pending_user:
+                turn_pairs.append(
+                    f'In session "{display_name}" ({session_date}): '
+                    f'You asked: "{pending_user}" - JARVIS replied: "{content}"'
+                )
+                pending_user = ""
+        recent_pairs = turn_pairs[-3:]
+        recent_pairs.reverse()
+        return recent_pairs
+
+    @staticmethod
+    def _session_excerpt(text: Any, limit: int = 120) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: max(0, limit - 3)].rstrip() + "..."
+
     def _session_candidates(self, query: str, limit: int) -> list[str]:
         lowered = query.lower()
         session_markers = (
@@ -1829,8 +1908,22 @@ class Memory:
             "our chat",
             "today's chat",
             "today chat",
+            "previous session",
+            "last session",
+            "what were we",
+            "what was i",
+            "what did we",
+            "what have i",
+            "what did we build",
+            "what was i doing",
+            "yesterday",
+            "earlier today",
             "recent conversation",
             "so far",
+            "what have we discussed",
+            "what did we discuss",
+            "tell me about our",
+            "summarize our",
         )
         return any(marker in lowered_query for marker in markers)
 

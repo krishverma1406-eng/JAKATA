@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from config.settings import SETTINGS, USER_REMINDERS_FILE, Settings
 
 _SERVICES: dict[str, "ReminderService"] = {}
+_RECUR_VALUES = {"none", "daily", "weekly", "weekdays"}
 
 
 class ReminderService:
@@ -56,6 +57,7 @@ class ReminderService:
         self,
         text: str,
         due_at: str | datetime,
+        recur: str = "none",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         reminder_text = str(text).strip()
@@ -69,6 +71,7 @@ class ReminderService:
             "due_at": due.astimezone(UTC).isoformat(),
             "created_at": datetime.now(UTC).isoformat(),
             "status": "pending",
+            "recur": self._normalize_recur(recur),
             "metadata": metadata or {},
         }
 
@@ -122,10 +125,25 @@ class ReminderService:
         with self._lock:
             reminders = self._read_reminders_unlocked()
             changed = False
+            now = datetime.now(UTC)
             for reminder in reminders:
                 if reminder.get("id") in ids and reminder.get("status") == "pending":
-                    reminder["status"] = "delivered"
-                    reminder["delivered_at"] = datetime.now(UTC).isoformat()
+                    recur = self._normalize_recur(reminder.get("recur", "none"))
+                    reminder["last_delivered_at"] = now.isoformat()
+                    if recur == "none":
+                        reminder["status"] = "delivered"
+                        reminder["delivered_at"] = now.isoformat()
+                    else:
+                        try:
+                            current_due = self._parse_due_at(reminder.get("due_at", ""))
+                            next_due = self._next_due_at(current_due, recur, now)
+                        except Exception:
+                            reminder["status"] = "delivered"
+                            reminder["delivered_at"] = now.isoformat()
+                        else:
+                            reminder["status"] = "pending"
+                            reminder["due_at"] = next_due.astimezone(UTC).isoformat()
+                            reminder.pop("delivered_at", None)
                     changed = True
             if changed:
                 self._write_reminders_unlocked(reminders)
@@ -183,6 +201,29 @@ class ReminderService:
         local_zone = ZoneInfo(self.settings.reminder_timezone)
         local_time = parsed.astimezone(local_zone)
         return local_time.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+    @staticmethod
+    def _normalize_recur(value: Any) -> str:
+        cleaned = str(value or "none").strip().lower() or "none"
+        return cleaned if cleaned in _RECUR_VALUES else "none"
+
+    def _next_due_at(self, current_due: datetime, recur: str, now: datetime) -> datetime:
+        candidate = current_due.astimezone(UTC)
+        normalized = self._normalize_recur(recur)
+        if normalized == "none":
+            return candidate
+
+        while True:
+            if normalized == "daily":
+                candidate += timedelta(days=1)
+            elif normalized == "weekly":
+                candidate += timedelta(weeks=1)
+            elif normalized == "weekdays":
+                candidate += timedelta(days=1)
+                while candidate.weekday() >= 5:
+                    candidate += timedelta(days=1)
+            if candidate > now:
+                return candidate
 
 
 def get_reminder_service(settings: Settings | None = None) -> ReminderService:

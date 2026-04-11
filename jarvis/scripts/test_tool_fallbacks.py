@@ -92,11 +92,11 @@ class DummyTools:
 
 TOOL_DEFINITIONS = [
     {"name": "app_launcher_tool", "description": "Launch local apps."},
-    {"name": "os_control", "description": "Desktop automation and open app actions."},
     {"name": "browser_control", "description": "Open and control browser pages."},
     {"name": "web_search", "description": "Search the web."},
     {"name": "weather_tool", "description": "Weather lookup."},
     {"name": "gmail_tool", "description": "Gmail access."},
+    {"name": "terminal_tool", "description": "Run terminal commands."},
 ]
 
 
@@ -131,11 +131,6 @@ def test_app_launcher_chain() -> None:
                     {"id": "1", "name": "app_launcher_tool", "arguments": {"app_name": "VS Code"}},
                 ]
             },
-            {
-                "tool_calls": [
-                    {"id": "2", "name": "os_control", "arguments": {"action": "open_app", "target": "code"}},
-                ]
-            },
             {"content": "VS Code is now open.", "tool_calls": []},
         ]
     )
@@ -143,7 +138,7 @@ def test_app_launcher_chain() -> None:
         TOOL_DEFINITIONS,
         {
             "app_launcher_tool": [{"ok": False, "error": "executable not found"}],
-            "os_control": [{"ok": True, "opened": "code"}],
+            "terminal_tool": [{"ok": True, "stdout": "VS Code launched."}],
         },
     )
     agent = _make_agent(brain, tools)
@@ -152,14 +147,11 @@ def test_app_launcher_chain() -> None:
     final_answer = agent.run("Open VS Code.", event_handler=events.append)
 
     assert final_answer == "VS Code is now open."
-    assert [name for name, _ in tools.calls] == ["app_launcher_tool", "os_control"]
-    assert brain.calls[1]["tools"][:3] == ["app_launcher_tool", "os_control", "browser_control"]
-    latest_system = [m for m in brain.calls[1]["messages"] if m.get("role") == "system"][-1]["content"]
-    assert "app_launcher_tool" in latest_system
-    assert "os_control, browser_control" in latest_system
+    assert [name for name, _ in tools.calls] == ["app_launcher_tool", "terminal_tool"]
+    assert len(brain.calls) == 2
     fallback_event = [event for event in events if event.get("type") == "tool_fallback_suggested"][-1]
     assert fallback_event["failed_tool"] == "app_launcher_tool"
-    assert fallback_event["fallback_tools"] == ["os_control", "browser_control", "terminal_tool"][: len(fallback_event["fallback_tools"])]
+    assert fallback_event["fallback_tools"] == ["terminal_tool"]
 
 
 def test_weather_chain() -> None:
@@ -168,11 +160,6 @@ def test_weather_chain() -> None:
             {
                 "tool_calls": [
                     {"id": "1", "name": "weather_tool", "arguments": {"location": "Delhi"}},
-                ]
-            },
-            {
-                "tool_calls": [
-                    {"id": "2", "name": "web_search", "arguments": {"query": "current weather Delhi"}},
                 ]
             },
             {"content": "I checked the weather via web search after the weather API failed.", "tool_calls": []},
@@ -191,8 +178,7 @@ def test_weather_chain() -> None:
 
     assert "weather via web search" in final_answer
     assert [name for name, _ in tools.calls] == ["weather_tool", "web_search"]
-    latest_system = [m for m in brain.calls[1]["messages"] if m.get("role") == "system"][-1]["content"]
-    assert "web_search" in latest_system
+    assert len(brain.calls) == 2
 
 
 def test_auth_error_does_not_fallback() -> None:

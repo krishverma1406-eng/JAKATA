@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
@@ -13,7 +14,7 @@ TOOL_DEFINITION = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["overview", "processes", "battery", "disk"],
+                "enum": ["overview", "processes", "battery", "disk", "alerts"],
                 "description": "System info action to perform.",
             },
             "max_results": {
@@ -39,7 +40,7 @@ def execute(params: dict[str, Any]) -> dict[str, Any]:
 
     if action == "overview":
         memory = psutil.virtual_memory()
-        disk = psutil.disk_usage("/")
+        disk = psutil.disk_usage(_disk_root())
         battery = psutil.sensors_battery()
         return {
             "ok": True,
@@ -92,5 +93,52 @@ def execute(params: dict[str, Any]) -> dict[str, Any]:
                 }
             )
         return {"ok": True, "partitions": partitions}
+    if action == "alerts":
+        alerts: list[dict[str, Any]] = []
+        cpu = psutil.cpu_percent(interval=0.5)
+        memory = psutil.virtual_memory()
+        battery = psutil.sensors_battery()
+        disk = psutil.disk_usage(_disk_root())
+
+        if cpu > 85:
+            alerts.append(
+                {
+                    "type": "cpu",
+                    "level": "warning",
+                    "message": f"CPU at {cpu}% - something is taxing the processor",
+                }
+            )
+        if memory.percent > 90:
+            alerts.append(
+                {
+                    "type": "ram",
+                    "level": "critical",
+                    "message": (
+                        f"RAM at {memory.percent}% - only {memory.available / (1024 ** 3):.1f}GB free"
+                    ),
+                }
+            )
+        if battery and not battery.power_plugged and battery.percent < 20:
+            alerts.append(
+                {
+                    "type": "battery",
+                    "level": "warning",
+                    "message": f"Battery at {battery.percent}% - please plug in",
+                }
+            )
+        if disk.percent > 90:
+            alerts.append(
+                {
+                    "type": "disk",
+                    "level": "warning",
+                    "message": f"Disk at {disk.percent}% - {disk.free / (1024 ** 3):.0f}GB remaining",
+                }
+            )
+        return {"ok": True, "alerts": alerts, "all_clear": len(alerts) == 0}
 
     return {"ok": False, "error": f"Unsupported action: {action}"}
+
+
+def _disk_root() -> str:
+    anchor = Path.home().anchor
+    return anchor or "/"

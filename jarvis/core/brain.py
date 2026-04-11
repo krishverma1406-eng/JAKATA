@@ -45,7 +45,7 @@ class Brain:
         )
         self._prompt_cache_value = ""
         self._prompt_cache_state: tuple[tuple[str, int], ...] = ()
-        self._circuit = ProviderCircuitBreaker()
+        self._circuit = ProviderCircuitBreaker(failure_threshold=3, cooldown_seconds=60)
         self._max_input_tokens = 28000
 
     def chat(
@@ -66,64 +66,70 @@ class Brain:
         )
 
         provider_errors: list[str] = []
-        if not self._circuit.is_open("nvidia"):
-            try:
-                response = self._call_nvidia(
+        provider_attempts = (
+            (
+                "nvidia",
+                lambda: self._call_nvidia(
                     system_messages,
                     compiled_messages,
                     tools or [],
                     task_kind,
                     response_format,
                     stream_handler,
-                )
-                if self._response_has_payload(response):
-                    self._circuit.record_success("nvidia")
-                    return response
-                provider_errors.append("nvidia: empty response")
-                self._circuit.record_failure("nvidia")
-            except Exception as exc:  # pragma: no cover - depends on auth/network
-                provider_errors.append(f"nvidia: {exc}")
-                self._circuit.record_failure("nvidia")
-        else:
-            provider_errors.append("nvidia: skipped (circuit open)")
-
-        try:
-            response = self._call_groq(
-                system_messages,
-                compiled_messages,
-                tools or [],
-                task_kind,
-                response_format,
-                stream_handler,
-            )
-            if self._response_has_payload(response):
-                self._circuit.record_success("groq")
+                ),
+            ),
+            (
+                "groq",
+                lambda: self._call_groq(
+                    system_messages,
+                    compiled_messages,
+                    tools or [],
+                    task_kind,
+                    response_format,
+                    stream_handler,
+                ),
+            ),
+            (
+                "openrouter",
+                lambda: self._call_openrouter(
+                    system_messages,
+                    compiled_messages,
+                    tools or [],
+                    task_kind,
+                    response_format,
+                    stream_handler,
+                ),
+            ),
+        )
+        for provider_name, provider_call in provider_attempts:
+            response, error = self._call_with_circuit(provider_name, provider_call)
+            if response is not None:
                 return response
-            provider_errors.append("groq: empty response")
-            self._circuit.record_failure("groq")
-        except Exception as exc:  # pragma: no cover - depends on auth/network
-            provider_errors.append(f"groq: {exc}")
-            self._circuit.record_failure("groq")
-
-        try:
-            response = self._call_openrouter(
-                system_messages,
-                compiled_messages,
-                tools or [],
-                task_kind,
-                response_format,
-                stream_handler,
-            )
-            if self._response_has_payload(response):
-                self._circuit.record_success("openrouter")
-                return response
-            provider_errors.append("openrouter: empty response")
-            self._circuit.record_failure("openrouter")
-        except Exception as exc:  # pragma: no cover - depends on auth/network
-            provider_errors.append(f"openrouter: {exc}")
-            self._circuit.record_failure("openrouter")
+            if error:
+                provider_errors.append(error)
 
         return self._offline_response(compiled_messages, tools or [], provider_errors)
+
+    def _call_with_circuit(
+        self,
+        provider: str,
+        call: Callable[[], dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if self._circuit.is_open(provider):
+            return None, f"{provider}: skipped (circuit open)"
+
+        try:
+            response = call()
+        except Exception as exc:  # pragma: no cover - depends on auth/network
+            self._circuit.record_failure(provider)
+            return None, f"{provider}: {exc}"
+
+        if self._response_has_payload(response):
+            self._circuit.record_success(provider)
+            return response, None
+
+        self._circuit.record_failure(provider)
+        return None, f"{provider}: empty response"
 
     @staticmethod
     def _response_has_payload(response: dict[str, Any] | None) -> bool:

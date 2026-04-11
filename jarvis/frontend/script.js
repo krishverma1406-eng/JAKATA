@@ -305,23 +305,61 @@ async function processProactiveQueue() {
 }
 
 async function renderProactiveMessage(data) {
+    while (messageInput && messageInput.value.trim().length > 0) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
     addTypingIndicator();
-    await new Promise(resolve => setTimeout(resolve, 800 + Math.random() * 400));
+    const thinkTime = 600 + Math.random() * 800;
+    await new Promise(resolve => setTimeout(resolve, thinkTime));
     removeTypingIndicator();
 
-    const contentEl = addMessage('assistant', '');
     const fullText = String(data.message || '').trim();
+    if (!fullText) return;
+
+    const contentEl = addMessage('assistant', '');
+    const messageEl = contentEl.closest('.message');
+    const bodyEl = contentEl.parentElement;
+    const kind = String(data.kind || 'proactive').trim() || 'proactive';
+    if (messageEl) {
+        messageEl.classList.add('proactive-message', `proactive-${kind}`);
+        messageEl.dataset.kind = kind;
+    }
+
     let displayed = '';
     for (const char of fullText) {
         displayed += char;
-        contentEl.textContent = displayed;
-        await new Promise(resolve => setTimeout(resolve, 12));
+        if (typeof marked !== 'undefined') {
+            const dirty = marked.parse(displayed, { breaks: true, gfm: true });
+            contentEl.innerHTML = typeof DOMPurify !== 'undefined'
+                ? DOMPurify.sanitize(dirty)
+                : dirty;
+        } else {
+            contentEl.textContent = displayed;
+        }
+        const delay = '.!?,;:'.includes(char) ? 80 : 15;
+        await new Promise(resolve => setTimeout(resolve, delay));
     }
+    enhanceRenderedMessage(contentEl);
 
     const badge = document.createElement('div');
     badge.className = 'proactive-badge';
-    badge.textContent = data.kind === 'reminder' ? '⏰ Reminder' : '💡 JARVIS';
-    if (contentEl.parentElement) contentEl.parentElement.appendChild(badge);
+    const icons = {
+        reminder: '⏰ Reminder',
+        briefing: '⚡ JARVIS',
+        stale_task: '📌 Status Check',
+        alert: '⚠️ System Alert',
+    };
+    badge.textContent = icons[kind] || '💡 JARVIS';
+    if (kind) badge.classList.add(`proactive-badge-${kind}`);
+    if (bodyEl) bodyEl.appendChild(badge);
+
+    if (orb) {
+        orb.setActive(true);
+        setTimeout(() => {
+            if (orb) orb.setActive(false);
+        }, 2000);
+    }
 
     scrollToBottom();
 
@@ -1321,6 +1359,7 @@ const ACTIVITY_STEPS = {
     search_completed:    { step: 0, label: 'Search completed' },
     context_retrieved:   { step: 0, label: 'Context retrieved' },
     background_dispatched: { step: 0, label: 'Background tasks' },
+    tool_fallback_suggested: { step: 0, label: 'Trying fallback' },
     first_chunk:         { step: 6, label: 'Core responded' },
 };
 
@@ -1396,6 +1435,9 @@ function appendActivity(activity) {
     } else if (activity.event === 'context_retrieved') {
         detail = activity.message || 'Knowledge base ready';
         item.classList.add('activity-sub', 'route-general');
+    } else if (activity.event === 'tool_fallback_suggested') {
+        detail = activity.message || 'Primary tool failed, trying fallback...';
+        item.classList.add('activity-sub', 'route-task');
     } else {
         detail = activity.message || (typeof activity === 'object' ? JSON.stringify(activity) : String(activity));
     }

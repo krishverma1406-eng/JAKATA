@@ -74,7 +74,7 @@ class PlannerRegressionTests(unittest.TestCase):
         planner = Planner(brain)
 
         plan = planner.create_plan(
-            "Search the web then summarize the answer carefully for me.",
+            "Search the web then send an email with the answer carefully for me.",
             self.tool_definitions,
         )
 

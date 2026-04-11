@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from config.settings import BASE_DIR, SETTINGS
+from config.settings import BASE_DIR, SCREENSHOTS_DIR, SETTINGS
 from core.agent import Agent
 from core.interface_config import INTERFACE_CONFIG
 from core.memory import Memory
@@ -42,6 +42,8 @@ app.add_middleware(
 
 if FRONTEND_DIR.exists():
     app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+if SCREENSHOTS_DIR.exists():
+    app.mount("/generated", StaticFiles(directory=str(SCREENSHOTS_DIR), html=False), name="generated")
 
 
 class ChatRequest(BaseModel):
@@ -75,6 +77,7 @@ _SESSIONS_LOCK = threading.Lock()
 _TASKS: dict[str, dict[str, Any]] = {}
 _SERVER_MEMORY: Memory | None = None
 _SSE_QUEUES: dict[str, list[tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]]] = defaultdict(list)
+_PROACTIVE_BACKLOG: dict[str, list[dict[str, Any]]] = defaultdict(list)
 _SSE_LOCK = threading.Lock()
 _PROACTIVE_ENGINES: dict[str, ProactiveEngine] = {}
 
@@ -90,6 +93,29 @@ def _get_memory() -> Memory:
     return _SERVER_MEMORY
 
 
+def _dispatch_proactive_message(session_id: str, message: dict[str, Any]) -> None:
+    with _SSE_LOCK:
+        queues = list(_SSE_QUEUES.get(session_id, []))
+        if not queues:
+            backlog = _PROACTIVE_BACKLOG[session_id]
+            backlog.append(dict(message))
+            if len(backlog) > 20:
+                del backlog[:-20]
+            return
+    for loop, queue_ref in queues:
+        try:
+            loop.call_soon_threadsafe(queue_ref.put_nowait, message)
+        except Exception:
+            continue
+
+
+def _drain_proactive_backlog(session_id: str) -> list[dict[str, Any]]:
+    with _SSE_LOCK:
+        backlog = list(_PROACTIVE_BACKLOG.get(session_id, []))
+        _PROACTIVE_BACKLOG.pop(session_id, None)
+    return backlog
+
+
 def _get_or_create_proactive_engine(session_id: str) -> ProactiveEngine:
     with _SESSIONS_LOCK:
         engine = _PROACTIVE_ENGINES.get(session_id)
@@ -97,13 +123,7 @@ def _get_or_create_proactive_engine(session_id: str) -> ProactiveEngine:
             return engine
 
         def on_proactive_message(message: dict[str, Any]) -> None:
-            with _SSE_LOCK:
-                queues = list(_SSE_QUEUES.get(session_id, []))
-            for loop, queue_ref in queues:
-                try:
-                    loop.call_soon_threadsafe(queue_ref.put_nowait, message)
-                except Exception:
-                    continue
+            _dispatch_proactive_message(session_id, message)
 
         engine = ProactiveEngine(on_message=on_proactive_message, session_id=session_id)
         engine.start()
@@ -127,6 +147,7 @@ def _session_payload(agent: Agent) -> dict[str, Any]:
 def _get_agent(session_id: str | None, mode: str | None = None) -> tuple[str, Agent]:
     proactive_sid = ""
     evicted_sid = ""
+    is_new = False
     with _SESSIONS_LOCK:
         sid = (session_id or "").strip() or uuid.uuid4().hex[:12]
         agent = _SESSIONS.get(sid)
@@ -140,6 +161,7 @@ def _get_agent(session_id: str | None, mode: str | None = None) -> tuple[str, Ag
             agent.bind_session(sid, mode=mode)
             _SESSIONS[sid] = agent
             proactive_sid = sid
+            is_new = True
         elif mode:
             agent.set_mode(mode)
             proactive_sid = sid
@@ -149,8 +171,13 @@ def _get_agent(session_id: str | None, mode: str | None = None) -> tuple[str, Ag
         engine = _PROACTIVE_ENGINES.pop(evicted_sid, None)
         if engine is not None:
             engine.stop()
+        with _SSE_LOCK:
+            _SSE_QUEUES.pop(evicted_sid, None)
+            _PROACTIVE_BACKLOG.pop(evicted_sid, None)
     if proactive_sid:
-        _get_or_create_proactive_engine(proactive_sid)
+        engine = _get_or_create_proactive_engine(proactive_sid)
+        if is_new:
+            engine.on_session_start(proactive_sid)
     return sid, agent
 
 
@@ -188,6 +215,57 @@ def _normalize_search_results(tool_result: dict[str, Any], arguments: dict[str, 
     }
 
 
+def _start_image_task(prompt: str) -> dict[str, Any]:
+    task_id = uuid.uuid4().hex[:12]
+    _TASKS[task_id] = {
+        "task_id": task_id,
+        "status": "running",
+        "type": "generate image",
+        "label": "Generating image",
+        "prompt": str(prompt or "").strip(),
+    }
+    return {
+        "task_id": task_id,
+        "type": "generate image",
+        "label": "Generating image",
+        "prompt": str(prompt or "").strip(),
+    }
+
+
+def _complete_image_task(task_id: str, result: dict[str, Any]) -> None:
+    task = dict(_TASKS.get(task_id, {"task_id": task_id}))
+    task["type"] = "generate image"
+    task["prompt"] = str(task.get("prompt") or result.get("prompt") or "").strip()
+    if not isinstance(result, dict) or result.get("ok") is False:
+        task["status"] = "failed"
+        task["error"] = str((result or {}).get("error", "Image generation failed.")).strip() or "Image generation failed."
+        _TASKS[task_id] = task
+        return
+
+    image_url = str(result.get("url", "")).strip()
+    if not image_url and result.get("path"):
+        image_url = f"/generated/{Path(str(result['path'])).name}"
+    if not image_url:
+        task["status"] = "failed"
+        task["error"] = "Image generation returned no image URL."
+        _TASKS[task_id] = task
+        return
+
+    task["status"] = "completed"
+    task["label"] = "Generated image"
+    task["result"] = {
+        "type": "image",
+        "url": image_url,
+        "path": str(result.get("path", "")).strip(),
+        "prompt": str(result.get("prompt", "")).strip(),
+        "provider": str(result.get("provider", "")).strip(),
+        "model": str(result.get("model", "")).strip(),
+        "style": str(result.get("style", "")).strip(),
+        "size": str(result.get("size", "")).strip(),
+    }
+    _TASKS[task_id] = task
+
+
 def _persist_non_tool_turn(agent: Agent, user_message: str, assistant_message: str) -> None:
     agent._remember_turn(user_message, assistant_message)
     agent.memory.persist_conversation(
@@ -220,6 +298,7 @@ def _build_stream(request: ChatRequest) -> Any:
         route_emitted = False
         stream_started_emitted = False
         current_route = "chat"
+        pending_image_tasks: list[str] = []
 
         def ensure_connected() -> None:
             if abort.is_set():
@@ -267,6 +346,29 @@ def _build_stream(request: ChatRequest) -> Any:
             if event_type == "stream_cancelled":
                 emit({"stream_cancelled": True})
                 return
+            if event_type == "tool_fallback_suggested":
+                failed_tool = str(event.get("failed_tool", "")).strip()
+                fallback_tools = [
+                    str(item).strip()
+                    for item in event.get("fallback_tools", [])
+                    if str(item).strip()
+                ]
+                fallback_text = ", ".join(fallback_tools) if fallback_tools else "fallback tool"
+                message = (
+                    f"{failed_tool or 'Tool'} failed, trying {fallback_text}..."
+                )
+                emit(
+                    {
+                        "activity": {
+                            "event": "tool_fallback_suggested",
+                            "message": message,
+                            "failed_tool": failed_tool,
+                            "fallback_tools": fallback_tools,
+                            "error": str(event.get("error", "")).strip(),
+                        }
+                    }
+                )
+                return
             tool_name = str(event.get("name", "")).strip()
             arguments = event.get("arguments", {})
             result = event.get("result", {})
@@ -291,6 +393,11 @@ def _build_stream(request: ChatRequest) -> Any:
                     if not route_emitted:
                         emit({"activity": {"event": "routing", "route": "vision"}})
                         route_emitted = True
+                elif tool_name == "image_gen_tool":
+                    task_meta = _start_image_task(str(arguments.get("prompt", "")).strip())
+                    pending_image_tasks.append(str(task_meta["task_id"]))
+                    emit({"activity": {"event": "tasks_executing", "message": "Generating image..."}})
+                    emit({"background_tasks": [task_meta]})
                 else:
                     emit(
                         {
@@ -320,6 +427,10 @@ def _build_stream(request: ChatRequest) -> Any:
                     if not stream_started_emitted:
                         emit({"activity": {"event": "streaming_started", "route": "realtime"}})
                         stream_started_emitted = True
+            elif tool_name == "image_gen_tool":
+                if pending_image_tasks:
+                    _complete_image_task(pending_image_tasks.pop(0), result if isinstance(result, dict) else {})
+                emit({"activity": {"event": "tasks_completed", "message": "Image ready."}})
             else:
                 emit(
                     {
@@ -519,6 +630,8 @@ async def session_stream(session_id: str) -> StreamingResponse:
         _SSE_QUEUES[session_id].append((loop, queue_ref))
 
     _get_or_create_proactive_engine(session_id)
+    for message in _drain_proactive_backlog(session_id):
+        queue_ref.put_nowait(message)
 
     async def event_gen() -> Any:
         try:

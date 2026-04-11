@@ -21,6 +21,8 @@ let safariVoiceHintShown = false;
 let orb = null;
 let recognition = null;
 let ttsPlayer = null;
+let proactiveStream = null;
+let proactiveSessionId = null;
 const SETTINGS_KEY = 'jarvis_settings';
 const DEFAULT_SETTINGS = { autoOpenActivity: true, autoOpenSearchResults: true, voiceInterrupt: true };
 let settings = { ...DEFAULT_SETTINGS };
@@ -236,7 +238,10 @@ function renderModeButtons(modes) {
 function renderSessionMeta(session) {
     if (!session || typeof session !== 'object') return;
     sessionMeta = session;
-    if (session.session_id) sessionId = session.session_id;
+    if (session.session_id) {
+        sessionId = session.session_id;
+        if (proactiveSessionId !== session.session_id) connectProactiveStream(session.session_id);
+    }
     if (session.mode) currentMode = session.mode;
     if (sessionDisplay) {
         const name = (session.display_name || 'New session').trim();
@@ -244,6 +249,85 @@ function renderSessionMeta(session) {
         sessionDisplay.textContent = mode ? `${name} • ${mode}` : name;
     }
     setMode(currentMode);
+}
+
+function connectProactiveStream(id) {
+    const targetId = String(id || '').trim();
+    if (!targetId) return;
+    if (proactiveStream && proactiveSessionId === targetId) return;
+    if (proactiveStream) proactiveStream.close();
+
+    proactiveSessionId = targetId;
+    proactiveStream = new EventSource(`${API}/sessions/${encodeURIComponent(targetId)}/stream`);
+
+    proactiveStream.onmessage = (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            if (data.type === 'heartbeat') return;
+            if (data.type === 'proactive' && data.message) {
+                handleProactiveMessage(data);
+            }
+        } catch (_) {}
+    };
+
+    proactiveStream.onerror = () => {
+        if (proactiveStream) proactiveStream.close();
+        proactiveStream = null;
+        setTimeout(() => {
+            if (proactiveSessionId === targetId) connectProactiveStream(targetId);
+        }, 5000);
+    };
+}
+
+async function handleProactiveMessage(data) {
+    if (isStreaming) {
+        setTimeout(() => handleProactiveMessage(data), 3000);
+        return;
+    }
+
+    addTypingIndicator();
+    await new Promise(resolve => setTimeout(resolve, 800 + Math.random() * 400));
+    removeTypingIndicator();
+
+    const contentEl = addMessage('assistant', '');
+    const fullText = String(data.message || '').trim();
+    let displayed = '';
+    for (const char of fullText) {
+        displayed += char;
+        contentEl.textContent = displayed;
+        await new Promise(resolve => setTimeout(resolve, 12));
+    }
+
+    const badge = document.createElement('div');
+    badge.className = 'proactive-badge';
+    badge.textContent = data.kind === 'reminder' ? '⏰ Reminder' : '💡 JARVIS';
+    if (contentEl.parentElement) contentEl.parentElement.appendChild(badge);
+
+    scrollToBottom();
+
+    if (data.kind === 'reminder' && ttsPlayer?.enabled && typeof synthesizeText === 'function') {
+        try {
+            const audio = await synthesizeText(fullText);
+            if (audio) ttsPlayer.enqueue(audio);
+        } catch (_) {}
+    }
+}
+
+async function synthesizeText(text) {
+    const value = String(text || '').trim();
+    if (!value) return null;
+    try {
+        const response = await fetch(`${API}/tts`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: value }),
+        });
+        if (!response.ok) return null;
+        const payload = await response.json().catch(() => null);
+        return payload && payload.ok ? payload.audio || null : null;
+    } catch (_) {
+        return null;
+    }
 }
 
 function appendStartupMessages(messages) {
@@ -1047,6 +1131,9 @@ async function changeMode(mode) {
 async function newChat() {
     if (ttsPlayer) ttsPlayer.stop();
     if (camStream) stopCamera();
+    if (proactiveStream) proactiveStream.close();
+    proactiveStream = null;
+    proactiveSessionId = null;
     sessionId = null;
     sessionMeta = null;
     if (chatMessages) chatMessages.innerHTML = '';

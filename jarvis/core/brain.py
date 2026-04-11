@@ -442,18 +442,18 @@ class Brain:
             }
 
         offline_parsers: dict[str, Any] = {
-            "reminder_tool": self._parse_reminder_request,
+            "datetime_tool": lambda message: {} if any(word in message.lower() for word in ("time", "date", "day")) else None,
             "calculator_tool": self._parse_calculator_request,
             "system_info_tool": self._parse_system_info_request,
+            "reminder_tool": self._parse_reminder_request,
             "weather_tool": self._parse_weather_request,
             "gmail_tool": self._parse_gmail_request,
-            "app_launcher_tool": self._parse_app_launcher_request,
             "screenshot_tool": self._parse_screenshot_request,
             "clipboard_tool": self._parse_clipboard_request,
             "calendar_tool": self._parse_calendar_request,
-            "datetime_tool": lambda message: {} if any(word in message.lower() for word in ("time", "date", "day")) else None,
             "file_manager": self._parse_file_manager_request,
             "terminal_tool": self._parse_terminal_request,
+            "app_launcher_tool": self._parse_app_launcher_request,
             "memory_query": (
                 lambda message: {"query": message, "limit": 5}
                 if any(

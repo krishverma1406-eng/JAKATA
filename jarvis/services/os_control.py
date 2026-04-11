@@ -34,10 +34,43 @@ def click(x: int, y: int, button: str = "left", clicks: int = 1) -> dict[str, An
     return {"x": x, "y": y, "button": button, "clicks": clicks}
 
 
+def move_mouse(x: int, y: int, duration: float = 0.0) -> dict[str, Any]:
+    gui = _load_gui()
+    gui.moveTo(x, y, duration=max(0.0, duration))
+    return {"x": x, "y": y, "duration": max(0.0, duration)}
+
+
 def type_text(text: str, interval: float = 0.02) -> dict[str, Any]:
     gui = _load_gui()
     gui.write(text, interval=interval)
     return {"typed": text, "length": len(text)}
+
+
+def press_key(key: str, presses: int = 1, interval: float = 0.0) -> dict[str, Any]:
+    gui = _load_gui()
+    normalized_key = str(key).strip()
+    if not normalized_key:
+        raise RuntimeError("A key is required for press_key.")
+    gui.press(normalized_key, presses=max(1, presses), interval=max(0.0, interval))
+    return {"key": normalized_key, "presses": max(1, presses), "interval": max(0.0, interval)}
+
+
+def key_down(key: str) -> dict[str, Any]:
+    gui = _load_gui()
+    normalized_key = str(key).strip()
+    if not normalized_key:
+        raise RuntimeError("A key is required for key_down.")
+    gui.keyDown(normalized_key)
+    return {"key": normalized_key, "state": "down"}
+
+
+def key_up(key: str) -> dict[str, Any]:
+    gui = _load_gui()
+    normalized_key = str(key).strip()
+    if not normalized_key:
+        raise RuntimeError("A key is required for key_up.")
+    gui.keyUp(normalized_key)
+    return {"key": normalized_key, "state": "up"}
 
 
 def hotkey(*keys: str) -> dict[str, Any]:
@@ -52,11 +85,35 @@ def scroll(amount: int) -> dict[str, Any]:
     return {"amount": amount}
 
 
+def mouse_down(button: str = "left") -> dict[str, Any]:
+    gui = _load_gui()
+    gui.mouseDown(button=button)
+    return {"button": button, "state": "down"}
+
+
+def mouse_up(button: str = "left") -> dict[str, Any]:
+    gui = _load_gui()
+    gui.mouseUp(button=button)
+    return {"button": button, "state": "up"}
+
+
 def drag(start_x: int, start_y: int, end_x: int, end_y: int, duration: float = 0.2) -> dict[str, Any]:
     gui = _load_gui()
     gui.moveTo(start_x, start_y, duration=0)
     gui.dragTo(end_x, end_y, duration=duration, button="left")
     return {"start": [start_x, start_y], "end": [end_x, end_y], "duration": duration}
+
+
+def wait(seconds: float) -> dict[str, Any]:
+    duration = max(0.0, min(float(seconds), 10.0))
+    time.sleep(duration)
+    return {"waited": duration}
+
+
+def position() -> dict[str, Any]:
+    gui = _load_gui()
+    pos = gui.position()
+    return {"x": int(pos.x), "y": int(pos.y)}
 
 
 def open_app(target: str) -> dict[str, Any]:

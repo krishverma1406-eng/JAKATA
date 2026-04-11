@@ -21,7 +21,7 @@
 | `session_tool` | rename session, list sessions, past session | none | none |
 | `code_writer` | create a tool, write tool code, scaffold | none | none |
 | `music_player` | play local music, local file, play [file path] | VLC installed | browser_control |
-| `os_control` | click at, type on desktop, hotkey, drag | pyautogui installed | none |
+| `os_control` | desktop keyboard/mouse automation: type, press key, hotkey, key down/up, move, click, mouse down/up, scroll, drag, wait, screenshot, open/close app | pyautogui installed | none |
 | `terminal_tool` | PowerShell, cmd, run command, terminal | none | none |
 
 ## Output Rules
@@ -38,3 +38,4 @@
 - Do NOT use `music_player` for YouTube browser search — that's `browser_control`
 - Do NOT use `terminal_tool` instead of `file_manager` for basic file ops
 - Do NOT call `browser_control` if Nova Act API key is missing
+- For desktop automation, prefer `os_control` as the generic keyboard/mouse tool instead of inventing unsupported actions

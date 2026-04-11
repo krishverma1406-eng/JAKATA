@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Callable
 
 from config.settings import SETTINGS, Settings
@@ -14,6 +15,18 @@ from core.memory import Memory
 from core.planner import Planner
 from core.tool_registry import ToolRegistry
 
+
+TOOL_FALLBACK_CHAINS: dict[str, list[str]] = {
+    "browser_control": ["web_search"],
+    "weather_tool": ["web_search"],
+    "music_player": ["browser_control"],
+    "screenshot_tool": ["os_control"],
+    "reminder_tool": ["notes_tool"],
+    "app_launcher_tool": ["terminal_tool"],
+    "file_manager": ["terminal_tool"],
+    "gmail_tool": [],
+    "calendar_tool": [],
+}
 
 # Fallback hints for tool failures
 _FALLBACK_HINTS: dict[str, str] = {
@@ -74,25 +87,31 @@ _FALLBACK_HINTS: dict[str, str] = {
     ),
 }
 
+_FALLBACK_BLOCKING_SIGNALS = (
+    "api key",
+    "oauth",
+    "not configured",
+    "client_secret",
+    "client secret",
+    "token",
+    "credential",
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+)
+
+
+def _tool_failed(result: dict[str, Any]) -> bool:
+    inner = result.get("result", result)
+    return isinstance(inner, dict) and inner.get("ok") is False
+
 
 def _get_fallback_hint(tool_name: str, error: str) -> str:
     """Get fallback hint for a failed tool based on error type."""
     # Auth/config errors — never retry, never fallback
     error_lower = error.lower()
-    auth_signals = (
-        "api key",
-        "oauth",
-        "not configured",
-        "client_secret",
-        "client secret",
-        "token",
-        "credential",
-        "401",
-        "403",
-        "unauthorized",
-        "forbidden",
-    )
-    if any(signal in error_lower for signal in auth_signals):
+    if any(signal in error_lower for signal in _FALLBACK_BLOCKING_SIGNALS):
         return (
             f"{tool_name} requires configuration that is not set up. "
             "Tell the user exactly what's missing. Do not attempt any fallback."
@@ -294,18 +313,20 @@ class Agent:
             )
 
             for tool_call in tool_calls:
-                plan_step_index = self.planner.next_matching_step_index(plan, tool_call["name"])
+                tool_name = tool_call["name"]
+                tool_args = tool_call.get("arguments", {})
+                plan_step_index = self.planner.next_matching_step_index(plan, tool_name)
                 if event_handler is not None:
                     event_handler(
                         {
                             "type": "tool_started",
-                            "name": tool_call["name"],
-                            "arguments": tool_call.get("arguments", {}),
+                            "name": tool_name,
+                            "arguments": tool_args,
                         }
                     )
-                result = self.tools.run_tool(
-                    tool_call["name"],
-                    tool_call.get("arguments", {}),
+                result = self._execute_with_chain(
+                    tool_name=tool_name,
+                    arguments=tool_args,
                     runtime_context={
                         "session_id": self.session_id,
                         "session_mode": self.mode,
@@ -315,45 +336,32 @@ class Agent:
                 )
                 tool_trace.append(
                     {
-                        "name": tool_call["name"],
-                        "arguments": tool_call.get("arguments", {}),
+                        "name": tool_name,
+                        "arguments": tool_args,
                         "result": result,
+                        "fallback_used": bool(isinstance(result, dict) and result.get("_fallback_used", False)),
                     }
                 )
                 if event_handler is not None:
                     event_handler(
                         {
                             "type": "tool_result",
-                            "name": tool_call["name"],
-                            "arguments": tool_call.get("arguments", {}),
+                            "name": tool_name,
+                            "arguments": tool_args,
                             "result": result,
                         }
                     )
                 self.planner.mark_step_completed(
                     plan,
-                    tool_name=tool_call["name"],
+                    tool_name=tool_name,
                     step_index=plan_step_index,
                 )
-                
-                # Inject fallback hint if tool failed
+
                 tool_content = json.dumps(result, ensure_ascii=True, default=str)
-                if isinstance(result, dict) and result.get("ok") is False:
-                    error_msg = str(result.get("error", "unknown error")).strip()
-                    fallback_note = _get_fallback_hint(tool_call["name"], error_msg)
-                    if fallback_note:
-                        tool_content = json.dumps(
-                            {
-                                **result,
-                                "_fallback_instruction": fallback_note,
-                            },
-                            ensure_ascii=True,
-                            default=str,
-                        )
-                
                 messages.append(
                     {
                         "role": "tool",
-                        "name": tool_call["name"],
+                        "name": tool_name,
                         "tool_call_id": tool_call.get("id"),
                         "content": tool_content,
                     }
@@ -471,18 +479,8 @@ class Agent:
         config = self.interface.briefing()
         intro = str(config.get("intro", "Here is the current session snapshot.")).strip()
         max_items = max(1, int(config.get("max_items_per_section", 5) or 5))
-        sections: list[str] = [intro]
 
         project_items = self.memory.active_project_items(limit=max_items)
-        project_heading = str(config.get("projects_heading", "Active projects")).strip() or "Active projects"
-        empty_projects = str(config.get("empty_projects", "No active project notes found.")).strip()
-        if project_items:
-            sections.append(project_heading + ":\n" + "\n".join(f"- {item}" for item in project_items[:max_items]))
-        else:
-            sections.append(f"{project_heading}:\n- {empty_projects}")
-
-        reminder_heading = str(config.get("reminders_heading", "Pending reminders")).strip() or "Pending reminders"
-        empty_reminders = str(config.get("empty_reminders", "No pending reminders.")).strip()
         reminder_lines: list[str] = []
         try:
             from services.reminders import get_reminder_service
@@ -497,12 +495,6 @@ class Agent:
                     reminder_lines.append(f"- {text}" + (f" | due {due_at}" if due_at else ""))
         except Exception:
             reminder_lines = []
-        sections.append(
-            reminder_heading + ":\n" + ("\n".join(reminder_lines) if reminder_lines else f"- {empty_reminders}")
-        )
-
-        calendar_heading = str(config.get("calendar_heading", "Today's calendar")).strip() or "Today's calendar"
-        empty_calendar = str(config.get("empty_calendar", "No calendar events scheduled for today.")).strip()
         calendar_lines: list[str] = []
         try:
             from services.calendar_service import get_calendar_service
@@ -522,11 +514,46 @@ class Agent:
                 calendar_lines.append(line)
         except Exception:
             calendar_lines = []
-        sections.append(
-            calendar_heading + ":\n" + ("\n".join(calendar_lines) if calendar_lines else f"- {empty_calendar}")
-        )
 
-        return "\n\n".join(part for part in sections if part.strip()).strip()
+        raw_data = {
+            "projects": project_items[:max_items],
+            "reminders": reminder_lines[:max_items],
+            "calendar": calendar_lines[:max_items],
+            "time": datetime.now().strftime("%A, %I:%M %p"),
+        }
+
+        if not raw_data["projects"] and not raw_data["reminders"] and not raw_data["calendar"]:
+            return intro
+
+        prompt = (
+            "You are JARVIS giving Krish an operational briefing.\n"
+            "Synthesize this into 2-4 short punchy sentences.\n"
+            "Lead with what needs attention today.\n"
+            "Be specific, crisp, and direct.\n"
+            "Do not invent project names, deadlines, or events.\n"
+            "Data:\n"
+            + json.dumps(raw_data, ensure_ascii=False, indent=2)
+        )
+        try:
+            response = self.brain.chat(
+                messages=[{"role": "user", "content": prompt}],
+                task_kind="simple",
+                system_override="You are JARVIS. Briefing only. No filler.",
+            )
+            content = str(response.get("content", "")).strip()
+            if content:
+                return content
+        except Exception:
+            pass
+
+        fallback_sections: list[str] = [intro]
+        if project_items:
+            fallback_sections.append("Active projects:\n" + "\n".join(f"- {item}" for item in project_items[:max_items]))
+        if reminder_lines:
+            fallback_sections.append("Pending reminders:\n" + "\n".join(reminder_lines[:max_items]))
+        if calendar_lines:
+            fallback_sections.append("Today's calendar:\n" + "\n".join(calendar_lines[:max_items]))
+        return "\n\n".join(part for part in fallback_sections if part.strip()).strip()
 
     def _task_kind(self, user_message: str, plan: dict[str, Any]) -> str:
         lowered = user_message.lower()
@@ -880,6 +907,122 @@ class Agent:
         if markers is None:
             return True
         return any(marker in lowered for marker in markers)
+
+    def _merge_tool_definitions(
+        self,
+        existing: list[dict[str, Any]],
+        additions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for tool_definition in [*existing, *additions]:
+            name = str(tool_definition.get("name", "")).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            merged.append(tool_definition)
+        return merged
+
+    def _tool_error_blocks_fallback(self, error: str) -> bool:
+        lowered = str(error or "").lower()
+        return any(signal in lowered for signal in _FALLBACK_BLOCKING_SIGNALS)
+
+    def _execute_with_chain(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        runtime_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run a tool, then automatically try fallbacks before returning to the model."""
+        result = self.tools.run_tool(tool_name, arguments, runtime_context)
+        if isinstance(result, dict) and result.get("ok") is True:
+            return result
+
+        error_msg = str(result.get("error", "")).lower() if isinstance(result, dict) else ""
+        if self._tool_error_blocks_fallback(error_msg):
+            return result
+
+        fallbacks = TOOL_FALLBACK_CHAINS.get(tool_name, [])
+        for fallback_name in fallbacks:
+            if not self.tools.has_tool(fallback_name):
+                continue
+            fallback_args = self._adapt_args_for_fallback(tool_name, fallback_name, arguments)
+            fallback_result = self.tools.run_tool(fallback_name, fallback_args, runtime_context)
+            if isinstance(fallback_result, dict) and fallback_result.get("ok") is True:
+                fallback_result["_fallback_used"] = True
+                fallback_result["_original_tool"] = tool_name
+                fallback_result["_original_error"] = str(result.get("error", "")) if isinstance(result, dict) else ""
+                fallback_result["_fallback_tool"] = fallback_name
+                return fallback_result
+
+        if isinstance(result, dict):
+            result["_fallbacks_tried"] = list(fallbacks)
+            hint = _get_fallback_hint(tool_name, error_msg)
+            if hint:
+                result["_fallback_instruction"] = hint
+        return result
+
+    def _adapt_args_for_fallback(
+        self,
+        from_tool: str,
+        to_tool: str,
+        original_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Translate arguments from one tool schema to another."""
+        if from_tool == "browser_control" and to_tool == "web_search":
+            url = str(original_args.get("url", "")).strip()
+            query = str(original_args.get("task", "") or original_args.get("prompt", "") or url).strip()
+            return {"query": query or url, "max_results": 5}
+
+        if from_tool == "weather_tool" and to_tool == "web_search":
+            location = str(original_args.get("location", "")).strip()
+            action = str(original_args.get("action", "current")).strip()
+            query = f"{'forecast' if action == 'forecast' else 'current weather'} {location}".strip()
+            return {"query": query, "max_results": 3}
+
+        if from_tool == "screenshot_tool" and to_tool == "os_control":
+            return {"action": "screenshot"}
+
+        if from_tool == "app_launcher_tool" and to_tool == "terminal_tool":
+            target = str(original_args.get("target") or original_args.get("app_name") or "").strip()
+            return {
+                "action": "run",
+                "shell": "powershell",
+                "command": f"Start-Process '{target}'",
+            }
+
+        if from_tool == "file_manager" and to_tool == "terminal_tool":
+            action = str(original_args.get("action", "list")).strip()
+            path = str(original_args.get("path", ".")).strip()
+            pattern = str(original_args.get("pattern", "")).strip()
+            commands = {
+                "list": f"Get-ChildItem '{path}' | Select-Object Name, Length, LastWriteTime",
+                "read": f"Get-Content '{path}'",
+                "find": f"Get-ChildItem '{path}' -Recurse -Filter '*{pattern}*'",
+            }
+            return {
+                "action": "run",
+                "shell": "powershell",
+                "command": commands.get(action, f"Get-ChildItem '{path}'"),
+            }
+
+        if from_tool == "reminder_tool" and to_tool == "notes_tool":
+            text = str(original_args.get("text", "")).strip()
+            due = str(original_args.get("due_at", "")).strip()
+            return {
+                "action": "create",
+                "title": f"reminder-{datetime.now().strftime('%Y%m%d-%H%M')}",
+                "content": f"# Reminder\n{text}\n\nDue: {due or 'ASAP'}",
+            }
+
+        if from_tool == "music_player" and to_tool == "browser_control":
+            track = str(original_args.get("track", "")).strip()
+            return {
+                "action": "open",
+                "url": f"https://www.youtube.com/results?search_query={track.replace(' ', '+')}",
+            }
+
+        return dict(original_args or {})
 
     def _forced_tool_names(
         self,

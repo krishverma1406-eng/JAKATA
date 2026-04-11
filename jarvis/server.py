@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import queue
 import re
 import threading
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ from config.settings import BASE_DIR, SETTINGS
 from core.agent import Agent
 from core.interface_config import INTERFACE_CONFIG
 from core.memory import Memory
+from core.proactive_engine import ProactiveEngine
 from services.tts import synthesize_base64_sync
 
 
@@ -62,11 +65,18 @@ class SessionModeRequest(BaseModel):
     mode: str = Field(..., min_length=1, max_length=40)
 
 
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=12000)
+
+
 MAX_SESSIONS = 50
 _SESSIONS: dict[str, Agent] = {}
 _SESSIONS_LOCK = threading.Lock()
 _TASKS: dict[str, dict[str, Any]] = {}
 _SERVER_MEMORY: Memory | None = None
+_SSE_QUEUES: dict[str, list[tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]]] = defaultdict(list)
+_SSE_LOCK = threading.Lock()
+_PROACTIVE_ENGINES: dict[str, ProactiveEngine] = {}
 
 
 def _frontend_file(name: str) -> Path:
@@ -78,6 +88,27 @@ def _get_memory() -> Memory:
     if _SERVER_MEMORY is None:
         _SERVER_MEMORY = Memory(SETTINGS)
     return _SERVER_MEMORY
+
+
+def _get_or_create_proactive_engine(session_id: str) -> ProactiveEngine:
+    with _SESSIONS_LOCK:
+        engine = _PROACTIVE_ENGINES.get(session_id)
+        if engine is not None:
+            return engine
+
+        def on_proactive_message(message: dict[str, Any]) -> None:
+            with _SSE_LOCK:
+                queues = list(_SSE_QUEUES.get(session_id, []))
+            for loop, queue_ref in queues:
+                try:
+                    loop.call_soon_threadsafe(queue_ref.put_nowait, message)
+                except Exception:
+                    continue
+
+        engine = ProactiveEngine(on_message=on_proactive_message, session_id=session_id)
+        engine.start()
+        _PROACTIVE_ENGINES[session_id] = engine
+        return engine
 
 
 def _session_payload(agent: Agent) -> dict[str, Any]:
@@ -94,6 +125,8 @@ def _session_payload(agent: Agent) -> dict[str, Any]:
 
 
 def _get_agent(session_id: str | None, mode: str | None = None) -> tuple[str, Agent]:
+    proactive_sid = ""
+    evicted_sid = ""
     with _SESSIONS_LOCK:
         sid = (session_id or "").strip() or uuid.uuid4().hex[:12]
         agent = _SESSIONS.get(sid)
@@ -101,13 +134,24 @@ def _get_agent(session_id: str | None, mode: str | None = None) -> tuple[str, Ag
             if len(_SESSIONS) >= MAX_SESSIONS:
                 oldest_sid = next(iter(_SESSIONS))
                 _SESSIONS.pop(oldest_sid, None)
+                evicted_sid = oldest_sid
             session_settings = replace(SETTINGS, tts_enabled=True)
             agent = Agent(settings=session_settings)
             agent.bind_session(sid, mode=mode)
             _SESSIONS[sid] = agent
+            proactive_sid = sid
         elif mode:
             agent.set_mode(mode)
-        return sid, agent
+            proactive_sid = sid
+        else:
+            proactive_sid = sid
+    if evicted_sid:
+        engine = _PROACTIVE_ENGINES.pop(evicted_sid, None)
+        if engine is not None:
+            engine.stop()
+    if proactive_sid:
+        _get_or_create_proactive_engine(proactive_sid)
+    return sid, agent
 
 
 def _clean_message(message: str) -> str:
@@ -396,6 +440,81 @@ def update_session_mode(session_id: str, request: SessionModeRequest) -> dict[st
     }
 
 
+@app.get("/api/memory/records")
+def get_memory_records(
+    tag: str | None = None,
+    limit: int = 50,
+    include_demoted: bool = False,
+) -> dict[str, Any]:
+    memory = _get_memory()
+    payload = memory._load_records_payload()
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        records = []
+    if not include_demoted:
+        records = [record for record in records if record.get("active", True) and not record.get("demoted")]
+    if tag:
+        records = [record for record in records if str(record.get("tag", "")).upper() == str(tag).upper()]
+    records.sort(key=lambda record: str(record.get("updated_at", "")), reverse=True)
+    return {
+        "total": len(records),
+        "records": records[: max(1, min(limit, 500))],
+        "tags": {
+            label: sum(1 for record in records if record.get("tag") == label)
+            for label in ("PERSONAL", "PROJECT", "FACT")
+        },
+    }
+
+
+@app.delete("/api/memory/records/{record_id}")
+def delete_memory_record(record_id: str) -> dict[str, Any]:
+    memory = _get_memory()
+    payload = memory._load_records_payload()
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        records = []
+    remaining = [record for record in records if str(record.get("id", "")).strip() != record_id.strip()]
+    if len(remaining) == len(records):
+        return {"ok": False, "deleted": 0, "items": [], "error": "Record not found."}
+    deleted = [record for record in records if str(record.get("id", "")).strip() == record_id.strip()]
+    payload["records"] = remaining
+    payload["updated_at"] = memory._now_iso()
+    memory._save_records_payload(payload)
+    memory._rebuild_materialized_memory(stored_records_changed=True)
+    return {
+        "ok": True,
+        "deleted": len(deleted),
+        "items": [str(record.get("text", "")).strip() for record in deleted if str(record.get("text", "")).strip()],
+    }
+
+
+@app.get("/sessions/{session_id}/stream")
+async def session_stream(session_id: str) -> StreamingResponse:
+    queue_ref: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    with _SSE_LOCK:
+        _SSE_QUEUES[session_id].append((loop, queue_ref))
+
+    _get_or_create_proactive_engine(session_id)
+
+    async def event_gen() -> Any:
+        try:
+            while True:
+                try:
+                    message = await asyncio.wait_for(queue_ref.get(), timeout=30.0)
+                    yield _emit_sse(message)
+                except asyncio.TimeoutError:
+                    yield 'data: {"type": "heartbeat"}\n\n'
+        finally:
+            with _SSE_LOCK:
+                queues = _SSE_QUEUES.get(session_id, [])
+                entry = (loop, queue_ref)
+                if entry in queues:
+                    queues.remove(entry)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon() -> Response:
     return Response(status_code=204)
@@ -404,6 +523,12 @@ def favicon() -> Response:
 @app.post("/chat/jarvis/stream")
 def chat_jarvis_stream(request: ChatRequest) -> StreamingResponse:
     return StreamingResponse(_build_stream(request), media_type="text/event-stream")
+
+
+@app.post("/tts")
+def synthesize_text(request: TTSRequest) -> dict[str, Any]:
+    audio = synthesize_base64_sync(request.text, SETTINGS)
+    return {"ok": bool(audio), "audio": audio}
 
 
 @app.get("/tasks/{task_id}")

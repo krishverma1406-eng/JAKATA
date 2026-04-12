@@ -139,7 +139,7 @@ class AgentIntegrationRegressionTests(unittest.TestCase):
             [{"name": "task_manager", "result": {"ok": True, "task": {"title": "Ship tests", "status": "done"}}}],
         )
 
-        self.assertEqual(code_summary, "4")
+        self.assertEqual(code_summary, "Output: 4")
         self.assertEqual(task_summary, "Task 'Ship tests' is now done.")
 
 

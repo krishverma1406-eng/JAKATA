@@ -175,6 +175,117 @@ class Memory:
     def set_session_mode(self, session_id: str, mode: str) -> dict[str, Any]:
         return self.session_store.set_mode(session_id, mode)
 
+    def profile_fields(self) -> dict[str, str]:
+        entries = self._profile_candidate_entries()
+        city, origin = self._best_location_fields(entries)
+        name = self._best_profile_field(
+            entries,
+            patterns=(
+                r"(?:user(?:'s)?\s+name|name)\s*(?:is|:)\s*([A-Za-z][A-Za-z .'-]{1,80})",
+            ),
+        )
+        return {
+            "name": self._normalize_person_name(name),
+            "school": self._best_profile_field(
+                entries,
+                patterns=(
+                    r"(?:school\s+name|stud(?:y|ies)\s+at|studying\s+at)\s*(?:is|:)?\s*([A-Za-z][A-Za-z0-9 .&'-]{2,120})",
+                ),
+            ),
+            "city": city,
+            "origin": origin,
+            "grade": self._best_profile_field(
+                entries,
+                patterns=(
+                    r"(?:class|grade)\s*(\d{1,2}(?:st|nd|rd|th)?(?:\s+grade)?)",
+                    r"\b(\d{1,2}(?:st|nd|rd|th)\s+grade)\b",
+                ),
+            ),
+            "github_username": self._best_profile_field(
+                entries,
+                patterns=(
+                    r"github\s+username\s*(?:is|:)\s*([A-Za-z0-9._-]{2,64})",
+                ),
+            ),
+            "email": self._best_profile_field(
+                entries,
+                patterns=(
+                    r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
+                ),
+            ),
+        }
+
+    def profile_facts(self, limit: int = 5) -> list[str]:
+        fields = self.profile_fields()
+        facts: list[str] = []
+        name = fields.get("name", "").strip()
+        school = fields.get("school", "").strip()
+        city = fields.get("city", "").strip()
+        origin = fields.get("origin", "").strip()
+        github_username = fields.get("github_username", "").strip()
+        email = fields.get("email", "").strip()
+        grade = fields.get("grade", "").strip()
+
+        if name:
+            facts.append(f"Your name is {name}.")
+        if school:
+            facts.append(f"You study at {school}.")
+        if city and origin:
+            facts.append(f"You live in {city}, originally from {origin}.")
+        elif city:
+            facts.append(f"You live in {city}.")
+        if github_username:
+            facts.append(f"Your GitHub username is {github_username}.")
+        if email:
+            facts.append(f"Your email address is {email}.")
+        if grade:
+            facts.append(f"You are in {grade}.")
+        return facts[: max(1, limit)]
+
+    def active_project_catalog(self, limit: int = 10) -> list[dict[str, str]]:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            return []
+
+        ordered_records = sorted(
+            (
+                record for record in records
+                if isinstance(record, dict)
+                and str(record.get("tag", "")).strip().upper() == "PROJECT"
+                and record.get("active", True)
+                and not record.get("demoted")
+                and str(record.get("text", "")).strip()
+            ),
+            key=lambda record: (
+                -int(record.get("importance", 0) or 0),
+                -int(record.get("confidence", 0) or 0),
+                str(record.get("updated_at", "")),
+            ),
+            reverse=False,
+        )
+
+        catalog: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for record in ordered_records:
+            text = str(record.get("text", "")).strip()
+            extracted = self._extract_project_items_from_text(text)
+            for item in extracted:
+                normalized = self._normalize_project_item(item)
+                if not normalized:
+                    continue
+                key = self._project_catalog_key(normalized)
+                if key in seen:
+                    continue
+                seen.add(key)
+                catalog.append({"name": normalized, "detail": text})
+                if len(catalog) >= max(1, limit):
+                    return catalog
+        return catalog
+
+    def session_recall(self, query: str, limit: int | None = None) -> list[str]:
+        return self._recall_from_sessions(query, limit or self.settings.memory_top_k)
+
     def active_project_items(self, limit: int = 5) -> list[str]:
         payload = self._load_records_payload()
         records = payload.get("records", [])
@@ -238,6 +349,13 @@ class Memory:
             session_results = self._recall_from_sessions(query, limit)
             if session_results:
                 return session_results[:limit]
+            return []
+        canonical_hits = self._canonical_profile_hits(query, limit)
+        if canonical_hits:
+            return canonical_hits[:limit]
+        project_hits = self._project_query_hits(lowered, limit)
+        if project_hits:
+            return project_hits[:limit]
         semantic_ready = self._semantic_retrieval_ready()
         record_payload = self._load_records_payload()
         records = record_payload.get("records", [])
@@ -1693,18 +1811,28 @@ class Memory:
         return self.session_store.recent_session_candidates(limit_files=4, max_turns=max_turns)
 
     def _recall_from_sessions(self, query: str, limit: int) -> list[str]:
-        sessions = self.session_store.list_sessions(limit=10)
+        sessions = self.session_store.list_sessions(limit=20)
         if not sessions:
             return []
 
+        target_date = self._session_target_date(query)
+        if target_date:
+            dated_sessions = [
+                session
+                for session in sessions
+                if str(session.get("updated_at", "")).strip()[:10] == target_date
+            ]
+            if dated_sessions:
+                sessions = dated_sessions
+
         candidates: list[tuple[float, int, str]] = []
-        for session_index, session in enumerate(sessions[:5]):
+        for session_index, session in enumerate(sessions[:10]):
             session_id = str(session.get("session_id", "")).strip()
             if not session_id:
                 continue
             display_name = str(session.get("display_name", "Untitled session")).strip() or "Untitled session"
             updated_at = str(session.get("updated_at", "")).strip()
-            messages = self.session_store.load_messages(session_id, limit_messages=20)
+            messages = self.session_store.load_messages(session_id, limit_messages=120)
             turn_summaries = self._session_turn_summaries(display_name, updated_at, messages)
             for turn_offset, candidate in enumerate(turn_summaries):
                 score = self._token_overlap_score(query, candidate)
@@ -1756,9 +1884,9 @@ class Memory:
                     f'You asked: "{pending_user}" - JARVIS replied: "{content}"'
                 )
                 pending_user = ""
-        recent_pairs = turn_pairs[-3:]
-        recent_pairs.reverse()
-        return recent_pairs
+        if len(turn_pairs) <= 8:
+            return list(reversed(turn_pairs))
+        return list(reversed(turn_pairs[-8:]))
 
     @staticmethod
     def _session_excerpt(text: Any, limit: int = 120) -> str:
@@ -1926,6 +2054,317 @@ class Memory:
             "summarize our",
         )
         return any(marker in lowered_query for marker in markers)
+
+    def _canonical_profile_hits(self, query: str, limit: int) -> list[str]:
+        lowered = query.lower()
+        fields = self.profile_fields()
+        hits: list[str] = []
+
+        if any(marker in lowered for marker in ("what is my name", "my name", "who am i", "name and")):
+            name = fields.get("name", "").strip()
+            if name:
+                hits.append(f"Your name is {name}.")
+
+        if any(
+            marker in lowered
+            for marker in ("where do i live", "where i live", "where am i from", "where do i stay", "live and")
+        ):
+            city = fields.get("city", "").strip()
+            origin = fields.get("origin", "").strip()
+            if city and origin:
+                hits.append(f"You live in {city}, originally from {origin}.")
+            elif city:
+                hits.append(f"You live in {city}.")
+
+        if any(marker in lowered for marker in ("what school", "school name", "study in", "study at", "studying in")):
+            school = fields.get("school", "").strip()
+            if school:
+                hits.append(f"You study at {school}.")
+
+        if any(marker in lowered for marker in ("which class", "what class", "what grade", "which grade")):
+            grade = fields.get("grade", "").strip()
+            if grade:
+                hits.append(f"You are in {grade}.")
+
+        if any(marker in lowered for marker in ("github username", "github account", "github id")):
+            github_username = fields.get("github_username", "").strip()
+            if github_username:
+                hits.append(f"Your GitHub username is {github_username}.")
+
+        if any(marker in lowered for marker in ("email address", "my email", "email id")):
+            email = fields.get("email", "").strip()
+            if email:
+                hits.append(f"Your email address is {email}.")
+
+        if any(
+            marker in lowered
+            for marker in ("know about me", "specific things you know", "using my memory", "tell me 3 specific things")
+        ):
+            hits = self._merge_unique(hits, self.profile_facts(limit=max(limit, 3)))
+
+        return self._merge_unique(hits)[: max(1, limit)]
+
+    def _project_query_hits(self, lowered_query: str, limit: int) -> list[str]:
+        markers = (
+            "active projects",
+            "project list",
+            "full project list",
+            "working on right now",
+            "what are we working on",
+            "what am i working on",
+            "current projects",
+        )
+        if not any(marker in lowered_query for marker in markers):
+            return []
+        catalog = self.active_project_catalog(limit=max(limit, 10))
+        return [item["detail"] for item in catalog[: max(1, limit)]]
+
+    def _profile_candidate_entries(self) -> list[dict[str, Any]]:
+        payload = self._load_records_payload()
+        records = payload.get("records", [])
+        entries: list[dict[str, Any]] = []
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("tag", "")).strip().upper() != "PERSONAL":
+                    continue
+                text = str(record.get("text", "")).strip()
+                if not text or "assistant" in text.lower():
+                    continue
+                entries.append(
+                    {
+                        "text": text,
+                        "active": bool(record.get("active", True) and not record.get("demoted")),
+                        "source_type": str(record.get("source_type", "")).strip().lower(),
+                        "explicit": bool(record.get("explicit", False)),
+                        "updated_at": str(record.get("updated_at", "")).strip(),
+                    }
+                )
+
+        entities = self._load_entities_payload().get("entities", {})
+        if isinstance(entities, dict):
+            user_entity = entities.get("user")
+            if isinstance(user_entity, dict):
+                for fact in user_entity.get("facts", []):
+                    text = str(fact).strip()
+                    if text:
+                        entries.append(
+                            {
+                                "text": text,
+                                "active": True,
+                                "source_type": "entity",
+                                "explicit": False,
+                                "updated_at": "",
+                            }
+                        )
+
+        try:
+            for line in self.profile_path.read_text(encoding="utf-8").splitlines():
+                cleaned = re.sub(r"^\s*[-*]\s*", "", line).strip()
+                if cleaned:
+                    entries.append(
+                        {
+                            "text": cleaned,
+                            "active": True,
+                            "source_type": "profile_md",
+                            "explicit": True,
+                            "updated_at": "",
+                        }
+                    )
+        except OSError:
+            pass
+
+        return entries
+
+    def _best_profile_field(self, entries: list[dict[str, Any]], patterns: tuple[str, ...]) -> str:
+        best_value = ""
+        best_score = -1.0
+        for entry in entries:
+            text = str(entry.get("text", "")).strip()
+            if not text:
+                continue
+            for pattern in patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                value = re.sub(r"\s+", " ", str(match.group(1)).strip(" .,:;"))
+                if not value:
+                    continue
+                score = self._profile_entry_score(entry, value)
+                if score > best_score:
+                    best_score = score
+                    best_value = value
+        return best_value
+
+    def _best_location_fields(self, entries: list[dict[str, Any]]) -> tuple[str, str]:
+        best_city = ""
+        best_origin = ""
+        fallback_origin = ""
+        best_score = -1.0
+        patterns = (
+            r"lives?\s+in\s+([A-Za-z][A-Za-z .'-]{1,80})(?:\s+and\s+is\s+originally\s+from\s+([A-Za-z][A-Za-z0-9 ,.'-]{1,120}))?",
+            r"([A-Za-z][A-Za-z .'-]{1,80})\s+\(originally from\s+([^)]+)\)",
+        )
+        for entry in entries:
+            text = str(entry.get("text", "")).strip()
+            if not text:
+                continue
+            for pattern in patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                city = re.sub(r"\s+", " ", str(match.group(1)).strip(" .,:;"))
+                city = re.sub(r"\s+\b(?:with|for|since)\b.*$", "", city, flags=re.IGNORECASE).strip(" .,:;")
+                origin = ""
+                if match.lastindex and match.lastindex >= 2 and match.group(2):
+                    origin = re.sub(r"\s+", " ", str(match.group(2)).strip(" .,:;"))
+                if origin and not fallback_origin:
+                    fallback_origin = origin
+                score = self._profile_entry_score(entry, city)
+                if origin:
+                    score += 0.5
+                if score > best_score:
+                    best_score = score
+                    best_city = city
+                    best_origin = origin
+        return best_city, best_origin or fallback_origin
+
+    def _profile_entry_score(self, entry: dict[str, Any], value: str) -> float:
+        score = 0.0
+        if entry.get("active"):
+            score += 100.0
+        source_type = str(entry.get("source_type", "")).strip().lower()
+        if source_type == "canonicalized":
+            score += 25.0
+        elif source_type in {"profile_md", "entity"}:
+            score += 20.0
+        elif source_type == "manual_file":
+            score += 15.0
+        if entry.get("explicit"):
+            score += 5.0
+        score -= max(0, len(str(value).strip()) - 24) * 0.01
+        return score
+
+    def _extract_project_items_from_text(self, text: str) -> list[str]:
+        cleaned = re.sub(r"\s+", " ", str(text).strip()).strip(" .")
+        if not cleaned:
+            return []
+
+        collected: list[str] = []
+        patterns = (
+            (r"project named\s+(.+?)(?:\s+for\b|\s+with\b|\s+using\b|\s+featuring\b|\s+and\b|,|$)", False),
+            (r"app named\s+(.+?)(?:\s+for\b|\s+with\b|\s+using\b|\s+featuring\b|\s+and\b|,|$)", False),
+            (r"working on\s+(.+?)(?:\s+with\b|\s+using\b|\s+featuring\b|,|$)", False),
+            (r"(?:is\s+)?building\s+(.+?)(?:\s+with\b|\s+using\b|\s+featuring\b|,|$)", False),
+            (r"active projects include\s+(.+)", True),
+            (r"projects include\s+(.+)", True),
+        )
+        lowered = cleaned.lower()
+        for pattern, is_list in patterns:
+            match = re.search(pattern, cleaned, flags=re.IGNORECASE)
+            if not match:
+                continue
+            captured = str(match.group(1)).strip()
+            if is_list:
+                collected.extend(self._split_project_phrase(captured))
+            else:
+                collected.append(captured)
+                break
+
+        if " - located at" in lowered:
+            collected.append(cleaned.split(" - located at", 1)[0].strip())
+
+        if not collected:
+            if not re.match(r"^(?:the user(?:'s)?|user|you)\b", cleaned, flags=re.IGNORECASE):
+                candidate = self._normalize_project_item(cleaned)
+                if candidate and len(candidate) <= 60 and (
+                    any(marker in candidate.lower() for marker in ("project", "app", "website", "assistant", "platform", "game"))
+                    or (len(candidate.split()) <= 4 and candidate[:1].isalpha() and candidate[:1].isupper())
+                ):
+                    collected.append(candidate)
+
+        normalized: list[str] = []
+        for item in collected:
+            cleaned_item = self._normalize_project_item(item)
+            if cleaned_item:
+                normalized.append(cleaned_item)
+        return self._merge_unique(normalized)
+
+    def _split_project_phrase(self, value: str) -> list[str]:
+        phrase = str(value or "").strip(" .")
+        if not phrase:
+            return []
+        parts = re.split(r",|\band\b", phrase, flags=re.IGNORECASE)
+        return [part.strip(" .") for part in parts if part.strip(" .")]
+
+    @staticmethod
+    def _normalize_project_item(value: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(value or "").strip()).strip(" .")
+        cleaned = re.sub(r"\s*-\s*(?:a|an|the)\s+", " - ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(?:a|an|the)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(?:the user(?:'s)?|user|you)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"^(?:is|are|was|were|has|have|had|wants?|uses?|using|created|works?|working|plans?)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s*-\s*located at.*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+\b(?:with|using|featuring|including)\b.*$", "", cleaned, flags=re.IGNORECASE)
+        lowered = cleaned.lower()
+        reject_markers = (
+            "issue",
+            "issues",
+            "article",
+            "contest",
+            "subscription",
+            "token",
+            "credits",
+            "deactivation",
+            "temperature",
+            "humidity",
+            "wind",
+            "battery",
+            "cpu",
+            "ram",
+            "disk",
+            "email",
+            "bookmarked",
+            "notification",
+            "alert",
+        )
+        if any(marker in lowered for marker in reject_markers):
+            return ""
+        if "\\" in cleaned or "/" in cleaned or "@" in cleaned or ".com" in lowered:
+            return ""
+        if len(cleaned) < 3:
+            return ""
+        if len(cleaned.split()) > 12 and not any(
+            marker in lowered for marker in ("project", "app", "website", "assistant", "platform", "game")
+        ):
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _normalize_person_name(value: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(value or "").strip()).strip(" .,:;")
+        if cleaned.islower():
+            return cleaned.title()
+        return cleaned
+
+    @staticmethod
+    def _project_catalog_key(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+    def _session_target_date(self, query: str) -> str:
+        lowered = query.lower()
+        today = datetime.now().date()
+        if "yesterday" in lowered:
+            return (today - timedelta(days=1)).isoformat()
+        if "earlier today" in lowered or "today" in lowered:
+            return today.isoformat()
+        return ""
 
     def _rank_candidates(
         self,

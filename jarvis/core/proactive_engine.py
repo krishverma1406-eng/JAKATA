@@ -121,8 +121,14 @@ class ProactiveEngine:
         if cache_key in self._delivered_ids:
             return
 
+        user_name = ""
+        try:
+            user_name = str(self.memory.profile_fields().get("name", "")).strip()
+        except Exception:
+            user_name = ""
+        briefing_target = user_name or "the user"
         prompt = (
-            f"You are JARVIS giving Krish a {briefing_type} briefing. "
+            f"You are JARVIS giving {briefing_target} a {briefing_type} briefing. "
             "Synthesize this into 1-2 short punchy sentences. "
             "Lead with what's most important. Sound like Iron Man's JARVIS.\n\n"
             f"Projects: {', '.join(projects[:3])}\n"

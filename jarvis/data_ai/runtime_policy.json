@@ -1,0 +1,156 @@
+{
+  "markers": {
+    "confirmation_yes": [
+      "yes",
+      "y",
+      "yeah",
+      "yep",
+      "sure",
+      "ok",
+      "okay",
+      "do it",
+      "go ahead",
+      "confirm"
+    ],
+    "confirmation_no": [
+      "no",
+      "n",
+      "nope",
+      "cancel",
+      "stop",
+      "dont",
+      "don't"
+    ],
+    "profile_queries": [
+      "what is my name",
+      "where do i live",
+      "where i live",
+      "what school",
+      "study in",
+      "study at",
+      "who am i",
+      "using my memory",
+      "specific things you know",
+      "know about me"
+    ],
+    "project_queries": [
+      "active projects",
+      "project list",
+      "full project list",
+      "what are we working on",
+      "working on right now",
+      "what am i working on"
+    ],
+    "session_search_queries": [
+      "recent sessions"
+    ],
+    "session_summary_queries": [
+      "what did we talk",
+      "what we talked",
+      "what have we discussed",
+      "what did we discuss",
+      "summarize our",
+      "our chat",
+      "chat so far",
+      "conversation so far",
+      "recent chat",
+      "recent conversation",
+      "previous session",
+      "previous sessions",
+      "last session",
+      "what were we",
+      "what did we build",
+      "what was i doing",
+      "yesterday",
+      "earlier today"
+    ],
+    "system_slow_queries": [
+      "cpu is feeling slow",
+      "system is slow",
+      "computer is slow",
+      "slow check whats happening",
+      "slow check what's happening",
+      "check whats happening",
+      "check what's happening"
+    ],
+    "note_followup_queries": [
+      "open that note",
+      "read that note",
+      "show that note",
+      "open the note"
+    ],
+    "image_followup_queries": [
+      "where did you save",
+      "where you saved",
+      "open it",
+      "open for me",
+      "where is the image"
+    ],
+    "screenshot_describe_queries": [
+      "what is on my screen",
+      "what's on my screen",
+      "tell me whats on my screen",
+      "tell me what's on my screen",
+      "describe my screen"
+    ],
+    "file_delete_queries": [
+      "delete",
+      "remove"
+    ],
+    "downloads_folder_queries": [
+      "downloads folder",
+      "download folder",
+      "my downloads",
+      "downloads"
+    ],
+    "youtube_service_queries": [
+      "youtube"
+    ],
+    "youtube_action_queries": [
+      "open",
+      "search",
+      "play"
+    ],
+    "web_note_queries": [
+      "search the web",
+      "save a note"
+    ],
+    "image_generation_queries": [
+      "generate image",
+      "generate an image",
+      "create image",
+      "create an image",
+      "make an image",
+      "make a picture",
+      "draw",
+      "visualize"
+    ],
+    "vscode_queries": [
+      "vscode",
+      "vs code"
+    ],
+    "vscode_open_queries": [
+      "open"
+    ],
+    "vscode_target_queries": [
+      "folder",
+      "project"
+    ],
+    "code_execution_queries": [
+      "run this code",
+      "execute this code",
+      "run this code for me",
+      "run it with test cases",
+      "run it with test case",
+      "test this code"
+    ],
+    "offline_capability_queries": [
+      "wifi is down",
+      "without internet"
+    ],
+    "offline_capability_action_queries": [
+      "what can you still do",
+      "what can you do"
+    ]
+  }
+}

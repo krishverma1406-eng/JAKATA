@@ -214,12 +214,19 @@ class SessionStore:
         matches: list[tuple[float, dict[str, Any]]] = []
 
         for session in self.list_sessions(limit=200):
+            records = [
+                record
+                for record in self._read_session_records(self._session_path(session))
+                if record.get("role") in {"user", "assistant"} and str(record.get("content", "")).strip()
+            ]
+            transcript_text = " ".join(str(record.get("content", "")).strip() for record in records[:200])
             search_text = " ".join(
                 [
                     str(session.get("display_name", "")),
                     str(session.get("first_user_message", "")),
                     str(session.get("last_user_message", "")),
                     str(session.get("last_assistant_message", "")),
+                    transcript_text,
                 ]
             ).strip()
             if not search_text:
@@ -228,7 +235,7 @@ class SessionStore:
             if score <= 0:
                 continue
             session_copy = dict(session)
-            session_copy["snippets"] = self._session_snippets(session_copy, query_tokens)
+            session_copy["snippets"] = self._session_snippets(session_copy, query_tokens, records=records)
             matches.append((score, session_copy))
 
         matches.sort(key=lambda item: (-item[0], str(item[1].get("updated_at", ""))), reverse=False)
@@ -436,30 +443,64 @@ class SessionStore:
         ]
         return collected[-max(1, limit_messages) :]
 
-    def _session_snippets(self, session: dict[str, Any], query_tokens: list[str]) -> list[str]:
+    def _session_snippets(
+        self,
+        session: dict[str, Any],
+        query_tokens: list[str],
+        records: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
         session_path = self._session_path(session)
-        records = [
-            record
-            for record in self._read_session_records(session_path)
-            if record.get("role") in {"user", "assistant"}
-        ]
+        transcript_records = records
+        if transcript_records is None:
+            transcript_records = [
+                record
+                for record in self._read_session_records(session_path)
+                if record.get("role") in {"user", "assistant"}
+            ]
+        records = transcript_records
         if not records:
             return []
 
         scored_snippets: list[tuple[float, str]] = []
-        for record in records[-24:]:
+        for index, record in enumerate(records):
             content = str(record.get("content", "")).strip()
             if not content:
                 continue
             score = self._score_text(" ".join(query_tokens), query_tokens, content)
+            previous_record = records[index - 1] if index > 0 else None
+            next_record = records[index + 1] if index + 1 < len(records) else None
+
             role = str(record.get("role", "")).strip().capitalize() or "Message"
-            snippet = f"{role}: {self._truncate(content, 180)}"
+            if str(record.get("role", "")).strip().lower() == "assistant" and previous_record and str(previous_record.get("role", "")).strip().lower() == "user":
+                snippet = (
+                    f'User: {self._truncate(str(previous_record.get("content", "")).strip(), 140)} | '
+                    f'Assistant: {self._truncate(content, 140)}'
+                )
+            elif str(record.get("role", "")).strip().lower() == "user" and next_record and str(next_record.get("role", "")).strip().lower() == "assistant":
+                snippet = (
+                    f'User: {self._truncate(content, 140)} | '
+                    f'Assistant: {self._truncate(str(next_record.get("content", "")).strip(), 140)}'
+                )
+            else:
+                snippet = f"{role}: {self._truncate(content, 180)}"
             scored_snippets.append((score, snippet))
         scored_snippets.sort(key=lambda item: item[0], reverse=True)
-        selected = [snippet for _, snippet in scored_snippets[:2] if snippet]
+        selected = [snippet for _, snippet in scored_snippets[:3] if snippet]
         if selected:
-            return selected
+            return self._dedupe_snippets(selected)
         return [f'Last exchange from "{session.get("display_name", "Untitled session")}": {self._truncate(str(records[-1].get("content", "")), 180)}']
+
+    @staticmethod
+    def _dedupe_snippets(snippets: list[str]) -> list[str]:
+        seen: set[str] = set()
+        unique: list[str] = []
+        for snippet in snippets:
+            cleaned = str(snippet).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            unique.append(cleaned)
+        return unique
 
     def _build_file_name(self, created_at: str, display_name: str, session_id: str) -> str:
         safe_stamp = re.sub(r"[^0-9]", "", created_at)[:14] or datetime.now().strftime("%Y%m%d%H%M%S")

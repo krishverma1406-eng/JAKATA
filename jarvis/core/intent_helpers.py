@@ -7,6 +7,7 @@ _EXPLICIT_CODE_WRITER_MARKERS = (
     "create a tool",
     "build a tool",
     "new jarvis tool",
+    "jarvis tool",
     "make a tool",
     "write tool code",
     "generate tool code",

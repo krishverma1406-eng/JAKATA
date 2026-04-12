@@ -107,8 +107,6 @@ _FALLBACK_BLOCKING_SIGNALS = (
     "403",
     "unauthorized",
     "forbidden",
-    "timed out",
-    "timeout",
 )
 _TOOL_CALL_TIMEOUT_SECONDS = 30
 
@@ -434,23 +432,17 @@ class Agent:
                     )
                     continue
                 seen_calls_this_turn.add(call_key)
-                confirmation = self._confirmation_payload_for_tool(tool_name, tool_args, user_message)
-                if confirmation is not None:
-                    prompt = self._queue_tool_confirmation(
-                        str(confirmation.get("tool_name", "")).strip(),
-                        dict(confirmation.get("arguments", {})),
-                        user_message,
-                        str(confirmation.get("prompt", "")).strip() or "Please confirm.",
-                    )
-                    if event_handler is not None:
-                        event_handler(
-                            {
-                                "type": "tool_confirmation_requested",
-                                "name": tool_name,
-                                "arguments": tool_args,
-                                "prompt": prompt,
-                            }
-                        )
+                plan_step_index = self.planner.next_matching_step_index(plan, tool_name)
+                result = self._run_workflow_tool(
+                    tool_name=tool_name,
+                    arguments=tool_args,
+                    runtime_context=base_runtime_context,
+                    event_handler=event_handler,
+                    tool_trace=tool_trace,
+                    source_request=user_message,
+                )
+                if isinstance(result, dict) and result.get("confirmation_required"):
+                    prompt = str(result.get("prompt", "")).strip() or "Please confirm."
                     return self._finalize_response(
                         user_message,
                         prompt,
@@ -464,39 +456,8 @@ class Agent:
                             "total_latency_ms": int((time.perf_counter() - total_started_at) * 1000),
                             "tool_count": len(tool_trace),
                             "plan_note": plan_note if plan_note != "No explicit plan required." else "",
+                            "confirmation_required": True,
                         },
-                    )
-                plan_step_index = self.planner.next_matching_step_index(plan, tool_name)
-                if event_handler is not None:
-                    event_handler(
-                        {
-                            "type": "tool_started",
-                            "name": tool_name,
-                            "arguments": tool_args,
-                        }
-                    )
-                result = self._execute_with_chain(
-                    tool_name=tool_name,
-                    arguments=tool_args,
-                    runtime_context=base_runtime_context,
-                    event_handler=event_handler,
-                )
-                tool_trace.append(
-                    {
-                        "name": tool_name,
-                        "arguments": tool_args,
-                        "result": result,
-                        "fallback_used": bool(isinstance(result, dict) and result.get("_fallback_used", False)),
-                    }
-                )
-                if event_handler is not None:
-                    event_handler(
-                        {
-                            "type": "tool_result",
-                            "name": tool_name,
-                            "arguments": tool_args,
-                            "result": result,
-                        }
                     )
                 self.planner.mark_step_completed(
                     plan,
@@ -581,6 +542,8 @@ class Agent:
             event_handler=event_handler,
             tool_trace=tool_trace,
             allow_fallback=False,
+            source_request=str(pending.get("source_request", "")).strip(),
+            skip_confirmation=True,
         )
         response = self._format_tool_result(
             str(pending.get("tool_name", "")).strip(),
@@ -652,8 +615,38 @@ class Agent:
         event_handler: Callable[[dict[str, Any]], None] | None = None,
         tool_trace: list[dict[str, Any]] | None = None,
         allow_fallback: bool = True,
+        source_request: str = "",
+        skip_confirmation: bool = False,
     ) -> dict[str, Any]:
         trace = tool_trace if tool_trace is not None else []
+        if not skip_confirmation:
+            confirmation = self._confirmation_payload_for_tool(tool_name, arguments, source_request)
+            if confirmation is not None:
+                prompt = self._queue_tool_confirmation(
+                    str(confirmation.get("tool_name", "")).strip(),
+                    dict(confirmation.get("arguments", {})),
+                    source_request,
+                    str(confirmation.get("prompt", "")).strip() or "Please confirm.",
+                )
+                result = {"ok": False, "confirmation_required": True, "prompt": prompt}
+                trace.append(
+                    {
+                        "name": tool_name,
+                        "arguments": dict(arguments),
+                        "result": result,
+                        "fallback_used": False,
+                    }
+                )
+                if event_handler is not None:
+                    event_handler(
+                        {
+                            "type": "tool_confirmation_requested",
+                            "name": tool_name,
+                            "arguments": arguments,
+                            "prompt": prompt,
+                        }
+                    )
+                return result
         if event_handler is not None:
             event_handler({"type": "tool_started", "name": tool_name, "arguments": arguments})
         result = (
@@ -1441,7 +1434,7 @@ class Agent:
         if not to_address or not subject or not body:
             return self._runtime_resolution("I found the unread email, but I could not build a safe reply from your instruction.", tool_trace=tool_trace)
         sender = str(latest.get("from", "")).strip() or to_address
-        response = self._queue_tool_confirmation(
+        send_result = self._run_workflow_tool(
             "gmail_tool",
             {
                 "action": "send",
@@ -1449,10 +1442,18 @@ class Agent:
                 "subject": f"Re: {subject}",
                 "body": body,
             },
-            user_message,
-            f'Send reply to {sender} about "{subject}" with this message: "{body}"?',
+            runtime_context,
+            event_handler=event_handler,
+            tool_trace=tool_trace,
+            allow_fallback=False,
+            source_request=user_message,
         )
-        return self._runtime_resolution(response, tool_trace=tool_trace)
+        if isinstance(send_result, dict) and send_result.get("confirmation_required"):
+            prompt = str(send_result.get("prompt", "")).strip() or (
+                f'Send reply to {sender} about "{subject}" with this message: "{body}"?'
+            )
+            return self._runtime_resolution(prompt, tool_trace=tool_trace, turn_meta={"confirmation_required": True})
+        return self._runtime_resolution(self._format_tool_result("gmail_tool", send_result, tool_trace), tool_trace=tool_trace)
 
     def _browser_runtime_response(
         self,
@@ -2262,12 +2263,16 @@ class Agent:
                 requested_tool_names.append(cleaned)
 
         forced_tools = self._forced_tool_names(user_message, all_tool_definitions, runtime_context=runtime_context)
+        classifier_tools = self._classify_tools_fast(user_message, all_tool_definitions)
         ranked_tools = ToolRegistry.rank_tool_definitions(user_message, all_tool_definitions)
         top_score = ranked_tools[0][1] if ranked_tools else 0.0
         capability_budget = self._tool_selection_budget(user_message, plan, forced_tools)
         score_floor = max(1.0, top_score * (0.35 if plan.get("needs_planning") else 0.45)) if top_score else 1.0
 
         for name in forced_tools:
+            add_tool(name)
+
+        for name in classifier_tools:
             add_tool(name)
 
         for step in plan.get("steps", []):
@@ -2371,7 +2376,7 @@ class Agent:
             ),
             "task_manager": (
                 "task", "todo", "to-do", "backlog", "mark done", "complete task",
-                "blocked", "in progress", "task list", "create task", "new task",
+                "blocked", "in progress", "task list", "create task", "create a task", "new task", "task for",
             ),
             "reminder_tool": (
                 "remind me", "reminder", "remind", "at 6", "at 7", "tomorrow at", "today at",
@@ -2424,7 +2429,7 @@ class Agent:
                 "execute this code", "stdin", "python snippet",
             ),
             "music_player": (
-                "local music", "play local", "mp3", "song file",
+                "local music", "play local", "play locally", "locally", "mp3", "song file",
             ),
         }
 
@@ -2731,6 +2736,7 @@ class Agent:
             for marker in (
                 "add task",
                 "create task",
+                "create a task",
                 "new task",
                 "track this task",
                 "todo",
@@ -2876,6 +2882,56 @@ class Agent:
 
         return forced & available
 
+    def _classify_tools_fast(
+        self,
+        user_message: str,
+        all_tool_definitions: list[dict[str, Any]],
+    ) -> list[str]:
+        available = [str(tool_definition.get("name", "")).strip() for tool_definition in all_tool_definitions]
+        available = [name for name in available if name]
+        if not available:
+            return []
+        prompt = (
+            "Return only a JSON array of tool names that are directly needed for this request.\n"
+            f"User message: {user_message}\n"
+            f"Available tools: {', '.join(available)}\n"
+            "Rules: choose the smallest useful set, include only names from the list, and return [] if no tool is needed."
+        )
+        try:
+            response = self.brain.chat(
+                messages=[{"role": "user", "content": prompt}],
+                tools=[],
+                task_kind="simple",
+                system_override="You classify tool needs. Return only valid JSON.",
+            )
+        except Exception:
+            return []
+        payload = self._parse_json_array(str(response.get("content", "")).strip())
+        if not isinstance(payload, list):
+            return []
+        allowed = set(available)
+        selected: list[str] = []
+        for item in payload:
+            name = str(item or "").strip()
+            if not name or name not in allowed or name in selected:
+                continue
+            selected.append(name)
+        return selected
+
+    @staticmethod
+    def _parse_json_array(value: str) -> list[Any] | None:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return None
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, list) else None
+
     def _explicit_code_writer_request(self, user_message: str) -> bool:
         return explicit_code_writer_request(user_message)
 
@@ -2883,29 +2939,6 @@ class Agent:
         lowered = user_message.lower().strip()
         if self._explicit_code_writer_request(user_message):
             return False
-
-        code_request_markers = (
-            "small code",
-            "small python",
-            "code snippet",
-            "small snippet",
-            "write code",
-            "give me code",
-            "show code",
-            "python class",
-            "python function",
-            "javascript function",
-            "js function",
-            "example code",
-            "sample code",
-            "just code",
-            "only code",
-            "only small code",
-            "write a class",
-            "write a function",
-            "make a class",
-            "make a function",
-        )
         file_or_system_markers = (
             "save",
             "write to file",
@@ -2934,9 +2967,32 @@ class Agent:
             ".css",
             ".json",
         )
-        if any(marker in lowered for marker in code_request_markers) and not any(
-            marker in lowered for marker in file_or_system_markers
-        ):
+        if any(marker in lowered for marker in file_or_system_markers):
+            return False
+
+        code_request_markers = (
+            "small code",
+            "small python",
+            "code snippet",
+            "small snippet",
+            "write code",
+            "give me code",
+            "show code",
+            "python class",
+            "python function",
+            "javascript function",
+            "js function",
+            "example code",
+            "sample code",
+            "just code",
+            "only code",
+            "only small code",
+            "write a class",
+            "write a function",
+            "make a class",
+            "make a function",
+        )
+        if any(marker in lowered for marker in code_request_markers):
             return True
         return False
 
@@ -3046,6 +3102,7 @@ class Agent:
         lowered = cleaned.lower()
         raw_tool_markers = (
             "toolcall>",
+            "toolcall>[",
             "toolcall>{",
             "memory_query result:",
             "tool result:",

@@ -87,6 +87,43 @@ class AgentFallbackRegressionTests(unittest.TestCase):
         self.assertEqual(events[-1]["failed_tool"], "weather_tool")
         self.assertEqual(events[-1]["fallback_tools"], ["web_search"])
 
+    def test_run_workflow_tool_requests_confirmation_before_external_write(self) -> None:
+        agent = Agent.__new__(Agent)
+        agent.pending_confirmation = None
+        agent._confirmation_payload_for_tool = Agent._confirmation_payload_for_tool.__get__(agent, Agent)
+        agent._queue_tool_confirmation = Agent._queue_tool_confirmation.__get__(agent, Agent)
+        agent._execute_with_chain = Mock(side_effect=AssertionError("tool execution should not run before confirmation"))
+
+        trace: list[dict[str, object]] = []
+        events: list[dict[str, object]] = []
+        result = Agent._run_workflow_tool(
+            agent,
+            "gmail_tool",
+            {"action": "send", "to": "a@example.com", "subject": "Hi", "body": "Hello"},
+            {},
+            event_handler=events.append,
+            tool_trace=trace,
+            source_request="send that email",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["confirmation_required"])
+        self.assertIn("Send reply to a@example.com", result["prompt"])
+        self.assertEqual(events[-1]["type"], "tool_confirmation_requested")
+        self.assertEqual(agent.pending_confirmation["tool_name"], "gmail_tool")
+
+    def test_sanitize_rewrites_uppercase_toolcall_dump(self) -> None:
+        agent = Agent.__new__(Agent)
+        agent._rewrite_tool_dump_as_answer = Mock(return_value="clean answer")
+
+        result = Agent._sanitize_assistant_message(
+            agent,
+            'TOOLCALL>[{"name":"memory_query"}]',
+            [{"name": "memory_query", "result": {"ok": True, "memories": ["x"]}}],
+        )
+
+        self.assertEqual(result, "clean answer")
+
 
 class ServerMemoryRegressionTests(unittest.TestCase):
     def test_get_memory_records_filters_and_counts_tags(self) -> None:

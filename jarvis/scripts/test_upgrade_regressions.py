@@ -17,6 +17,7 @@ from core.brain import Brain, ProviderCircuitBreaker
 from core.planner import Planner
 from core.session_store import SessionStore
 from core.agent import Agent
+from core.memory import Memory
 
 
 class UpgradeRegressionTests(unittest.TestCase):
@@ -99,7 +100,7 @@ class UpgradeRegressionTests(unittest.TestCase):
         self.assertIn("timed out", result.get("error", ""))
         self.assertLess(elapsed, 0.5)
 
-    def test_execute_with_chain_skips_fallback_after_timeout(self) -> None:
+    def test_execute_with_chain_uses_fallback_after_timeout(self) -> None:
         class SlowTools:
             calls: list[str] = []
 
@@ -114,6 +115,7 @@ class UpgradeRegressionTests(unittest.TestCase):
             tools=SlowTools(),
             _adapt_args_for_fallback=lambda *_args, **_kwargs: {},
         )
+        dummy._tool_is_registered = lambda _name: True
         dummy._tool_error_blocks_fallback = Agent._tool_error_blocks_fallback.__get__(dummy, type(dummy))
         dummy._run_tool_with_timeout = lambda tool_name, *_args, **_kwargs: (
             {"ok": False, "error": f"{tool_name} timed out after 0.1s"}
@@ -121,7 +123,9 @@ class UpgradeRegressionTests(unittest.TestCase):
             else {"ok": True, "tool": tool_name}
         )
         result = Agent._execute_with_chain(dummy, "app_launcher_tool", {}, {})
-        self.assertFalse(result.get("ok", True))
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("tool"), "terminal_tool")
+        self.assertTrue(result.get("_fallback_used"))
         self.assertEqual(dummy.tools.calls, [])
 
     def test_nvidia_thinking_flag_only_added_for_supported_models(self) -> None:
@@ -169,6 +173,45 @@ class UpgradeRegressionTests(unittest.TestCase):
             Agent._task_kind(agent, "fix the api error in app.py", simple_plan),
             "code",
         )
+
+    def test_should_answer_code_directly_stays_false_when_request_mentions_running_tests(self) -> None:
+        agent = Agent.__new__(Agent)
+        agent._explicit_code_writer_request = lambda _message: False
+
+        self.assertFalse(
+            Agent._should_answer_code_directly(
+                agent,
+                "write a python function to check palindrome and run it with test cases",
+            )
+        )
+
+    def test_recall_from_sessions_accepts_created_at_date_match(self) -> None:
+        memory = Memory.__new__(Memory)
+        memory.settings = types.SimpleNamespace(memory_top_k=3)
+        memory.session_store = types.SimpleNamespace(
+            list_sessions=lambda limit=20: [
+                {
+                    "session_id": "abc",
+                    "display_name": "Yesterday",
+                    "created_at": "2026-04-11T09:00:00",
+                    "updated_at": "2026-04-12T08:00:00",
+                }
+            ],
+            load_messages=lambda _session_id, limit_messages=120: [
+                {"role": "user", "content": "what did we discuss yesterday"},
+                {"role": "assistant", "content": "We discussed the Yantra code."},
+            ],
+        )
+        memory._session_target_date = lambda _query: "2026-04-11"
+        memory._session_turn_summaries = Memory._session_turn_summaries.__get__(memory, Memory)
+        memory._session_excerpt = Memory._session_excerpt
+        memory._token_overlap_score = lambda _query, _candidate: 1.0
+        memory._query_focus_bonus = lambda _query, _candidate: 0.0
+
+        results = Memory._recall_from_sessions(memory, "what did we talk about yesterday", 3)
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("Yantra code", results[0])
 
     def test_frontend_handles_stream_cancelled_events(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "frontend" / "script.js").read_text(encoding="utf-8")

@@ -1820,7 +1820,11 @@ class Memory:
             dated_sessions = [
                 session
                 for session in sessions
-                if str(session.get("updated_at", "")).strip()[:10] == target_date
+                if target_date
+                in {
+                    str(session.get("created_at", "")).strip()[:10],
+                    str(session.get("updated_at", "")).strip()[:10],
+                }
             ]
             if dated_sessions:
                 sessions = dated_sessions
